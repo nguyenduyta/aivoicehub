@@ -11,6 +11,8 @@
 
 **AIVoiceHub** is a lightweight desktop overlay that **transcribes and translates audio in real time** (system audio or microphone).
 
+Easy to download [here](https://github.com/nguyenduyta/aivoicehub/releases) to install.
+
 Docs: [Install (macOS)](docs/installation_guide.md) · [Install (Windows)](docs/installation_guide_win.md) · [TTS](docs/tts_guide.md) · [Developing](docs/developing.md)
 
 ## Features
