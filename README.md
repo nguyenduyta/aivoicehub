@@ -15,11 +15,11 @@ Docs: [Install (macOS)](docs/installation_guide.md) · [Install (Windows)](docs/
 
 ## Features
 
-- **Live overlay**: compact UI that stays on top while you watch/listen.
+- **Live overlay**: lightweight window that can stay on top while you watch/listen.
 - **Two views**: Single (overlay) and Dual (source | translation).
 - **TTS narration** (optional): Edge (free), Google, ElevenLabs.
 - **Local mode** (Apple Silicon): offline pipeline using MLX (experimental).
-- **Transcripts saved locally** as Markdown.
+- **Transcripts saved locally** as Markdown: each session in its own folder under `transcripts/sessions/`; open **Conversation history** (clock icon) to resume.
 
 ## Quickstart (local dev)
 

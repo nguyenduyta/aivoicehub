@@ -27,8 +27,15 @@ class App {
         this.recordingStartTime = null;
         this.ttsEnabled = false;  // TTS runtime toggle
         this.isPinned = true;     // Always-on-top state
-        this.isCompact = false;   // Compact mode (hide control bar)
         this.isSummarizing = false;
+        /** Active conversation folder id (under transcripts/sessions/). null = next save creates a new folder. */
+        this.currentSessionId = null;
+        /** Conversations list (history view) */
+        this.historyPage = 1;
+        this.historyPageSize = 10;
+        this.historySearchQuery = '';
+        this._historyTotalPages = 0;
+        this._historySearchDebounce = null;
     }
 
     async init() {
@@ -106,6 +113,51 @@ class App {
     // ─── Event Binding ──────────────────────────────────────
 
     _bindEvents() {
+        // Conversation history
+        document.getElementById('btn-history')?.addEventListener('click', () => {
+            this._showView('history');
+        });
+        document.getElementById('btn-history-back')?.addEventListener('click', () => {
+            this._showView('overlay');
+        });
+        document.getElementById('btn-history-new')?.addEventListener('click', async () => {
+            await this._startNewConversation();
+        });
+
+        const historySearch = document.getElementById('history-search');
+        if (historySearch) {
+            const scheduleSearch = () => {
+                clearTimeout(this._historySearchDebounce);
+                this._historySearchDebounce = setTimeout(() => {
+                    this.historyPage = 1;
+                    this._refreshHistoryList();
+                }, 300);
+            };
+            historySearch.addEventListener('input', (e) => {
+                // Skip mid-composition (IME); compositionend will refresh
+                if (e.isComposing) return;
+                scheduleSearch();
+            });
+            historySearch.addEventListener('compositionend', () => {
+                this.historyPage = 1;
+                this._refreshHistoryList();
+            });
+        }
+        document.getElementById('history-page-prev')?.addEventListener('click', () => {
+            if (this.historyPage <= 1) return;
+            this.historyPage -= 1;
+            this._refreshHistoryList();
+        });
+        document.getElementById('history-page-next')?.addEventListener('click', () => {
+            if (this.historyPage >= this._historyTotalPages) return;
+            this.historyPage += 1;
+            this._refreshHistoryList();
+        });
+
+        document.getElementById('btn-new-conversation')?.addEventListener('click', async () => {
+            await this._startNewConversation();
+        });
+
         // Settings button
         document.getElementById('btn-settings').addEventListener('click', () => {
             this._showView('settings');
@@ -135,11 +187,6 @@ class App {
         // Pin/Unpin button
         document.getElementById('btn-pin').addEventListener('click', () => {
             this._togglePin();
-        });
-
-        // Compact mode button
-        document.getElementById('btn-compact').addEventListener('click', () => {
-            this._toggleCompact();
         });
 
         // View mode toggle (dual panel)
@@ -191,6 +238,7 @@ class App {
             this.transcriptUI.clear();
             this.transcriptUI.showPlaceholder();
             this.recordingStartTime = null;
+            this.currentSessionId = null;
         });
 
         // Copy transcript button
@@ -251,6 +299,19 @@ class App {
                 this.appWindow.startDragging();
             }
         });
+
+        document.getElementById('history-view')?.addEventListener('mousedown', (e) => {
+            // Include inputs/labels — same as settings view; otherwise search box gets preventDefault and never focuses.
+            const interactive = e.target.closest(
+                'button, input, select, label, textarea, a, .history-list, .history-row, .history-btn, .history-toolbar, .history-pagination',
+            );
+            if (!interactive && e.buttons === 1) {
+                e.preventDefault();
+                this.appWindow.startDragging();
+            }
+        });
+
+        this._setupMacMoreMenu();
 
         // Toggle API key visibility
         document.getElementById('btn-toggle-key').addEventListener('click', () => {
@@ -473,23 +534,61 @@ class App {
                 this._togglePin();
             }
 
-            // Cmd/Ctrl + D: Toggle Compact
-            if ((e.metaKey || e.ctrlKey) && e.key === 'd') {
-                e.preventDefault();
-                this._toggleCompact();
-            }
         });
     }
 
     // ─── Views ──────────────────────────────────────────────
 
     _showView(view) {
+        if (typeof this._closeMoreMenu === 'function') {
+            this._closeMoreMenu();
+        }
+
         document.getElementById('overlay-view').classList.toggle('active', view === 'overlay');
         document.getElementById('settings-view').classList.toggle('active', view === 'settings');
+        document.getElementById('history-view')?.classList.toggle('active', view === 'history');
 
         if (view === 'settings') {
             this._populateSettingsForm();
         }
+        if (view === 'history') {
+            this._refreshHistoryList();
+        }
+    }
+
+    /** macOS-style ⋯ menu (overflow) */
+    _setupMacMoreMenu() {
+        const btnMore = document.getElementById('btn-more');
+        const panel = document.getElementById('more-menu-panel');
+        if (!btnMore || !panel) return;
+
+        this._closeMoreMenu = () => {
+            panel.hidden = true;
+            btnMore.setAttribute('aria-expanded', 'false');
+        };
+
+        btnMore.addEventListener('click', (e) => {
+            e.stopPropagation();
+            const open = panel.hidden;
+            panel.hidden = !open;
+            btnMore.setAttribute('aria-expanded', open ? 'true' : 'false');
+        });
+
+        panel.addEventListener('click', () => {
+            queueMicrotask(() => this._closeMoreMenu());
+        });
+
+        document.addEventListener('click', (e) => {
+            if (panel.hidden) return;
+            if (e.target.closest('.mac-menu-wrap')) return;
+            this._closeMoreMenu();
+        });
+
+        document.addEventListener('keydown', (e) => {
+            if (e.key === 'Escape' && !panel.hidden) {
+                this._closeMoreMenu();
+            }
+        });
     }
 
     // ─── Settings Form ─────────────────────────────────────
@@ -1355,12 +1454,194 @@ class App {
         if (!content) return;
 
         try {
-            const path = await invoke('save_transcript', { content });
-            const filename = path.split('/').pop();
+            const result = await invoke('save_transcript_session', {
+                content,
+                sessionId: this.currentSessionId || null,
+            });
+            const sid = result?.sessionId ?? result?.session_id;
+            if (sid) this.currentSessionId = sid;
+            const filename = (result?.path || '').split('/').pop() || 'transcript.md';
             this._showToast(`Saved: ${filename}`, 'success');
         } catch (err) {
             console.error('Failed to save transcript:', err);
             this._showToast('Failed to save transcript', 'error');
+        }
+    }
+
+    async _startNewConversation() {
+        if (this.isRunning) {
+            this._showToast('Stop recording before starting a new conversation.', 'info');
+            return;
+        }
+        if (this.transcriptUI.hasSegments()) {
+            await this._saveTranscriptFile();
+        }
+        this.transcriptUI.clear();
+        this.transcriptUI.showPlaceholder();
+        this.recordingStartTime = null;
+        this.currentSessionId = null;
+        this._updateSummaryButtonState();
+        this._showView('overlay');
+        this._showToast('New conversation — previous text saved.', 'success');
+    }
+
+    async _refreshHistoryList() {
+        const list = document.getElementById('history-list');
+        const empty = document.getElementById('history-empty');
+        const pag = document.getElementById('history-pagination');
+        if (!list || !empty) return;
+
+        const defaultEmptyText =
+            empty.dataset.defaultText ||
+            'No saved conversations yet. Stop recording or clear to save.';
+        if (!empty.dataset.defaultText) empty.dataset.defaultText = defaultEmptyText;
+
+        // Always read current text from the field (fixes debounce / stale state).
+        const searchInput = document.getElementById('history-search');
+        if (searchInput) {
+            this.historySearchQuery = (searchInput.value || '').trim();
+        }
+        const searchQ = this.historySearchQuery || '';
+        const noMatchText = 'No conversations match your search.';
+
+        try {
+            // Must match Rust param name `args` — flat { page, pageSize } fails IPC deserialize.
+            const args = {
+                page: this.historyPage,
+                pageSize: this.historyPageSize,
+            };
+            if (searchQ) {
+                args.search = searchQ;
+            }
+            const raw = await invoke('list_conversation_sessions', { args });
+            const items = raw?.items ?? raw;
+            const total = raw?.total ?? (Array.isArray(items) ? items.length : 0);
+            const page = raw?.page ?? this.historyPage;
+            const totalPages = raw?.totalPages ?? raw?.total_pages ?? 0;
+
+            this.historyPage = page;
+            this._historyTotalPages = totalPages;
+
+            list.innerHTML = '';
+
+            if (!items || items.length === 0) {
+                empty.style.display = 'block';
+                empty.textContent = total === 0 && searchQ ? noMatchText : defaultEmptyText;
+                if (pag) pag.hidden = true;
+                return;
+            }
+            empty.style.display = 'none';
+            empty.textContent = defaultEmptyText;
+
+            if (pag) {
+                pag.hidden = false;
+                const prev = document.getElementById('history-page-prev');
+                const next = document.getElementById('history-page-next');
+                const info = document.getElementById('history-page-info');
+                if (prev) prev.disabled = page <= 1;
+                if (next) next.disabled = totalPages <= 1 || page >= totalPages;
+                if (info) {
+                    info.textContent =
+                        totalPages > 0
+                            ? `Page ${page} of ${totalPages} · ${total} total`
+                            : `${total} total`;
+                }
+            }
+
+            for (const s of items) {
+                const row = document.createElement('div');
+                row.className = 'history-row';
+
+                const main = document.createElement('div');
+                main.className = 'history-row-main';
+
+                const titleEl = document.createElement('div');
+                titleEl.className = 'history-row-title';
+                titleEl.textContent = s.title || s.id;
+
+                const metaEl = document.createElement('div');
+                metaEl.className = 'history-row-meta';
+                const updatedAt = s.updatedAt ?? s.updated_at;
+                metaEl.textContent = new Date(updatedAt).toLocaleString(undefined, {
+                    dateStyle: 'medium',
+                    timeStyle: 'medium',
+                });
+
+                const previewEl = document.createElement('div');
+                previewEl.className = 'history-row-preview';
+                previewEl.textContent = s.preview || '';
+
+                main.appendChild(titleEl);
+                main.appendChild(metaEl);
+                main.appendChild(previewEl);
+
+                const actions = document.createElement('div');
+                actions.className = 'history-row-actions';
+
+                const btnContinue = document.createElement('button');
+                btnContinue.type = 'button';
+                btnContinue.className = 'history-btn primary';
+                btnContinue.dataset.action = 'continue';
+                btnContinue.dataset.id = s.id;
+                btnContinue.textContent = 'Continue';
+
+                const btnFolder = document.createElement('button');
+                btnFolder.type = 'button';
+                btnFolder.className = 'history-btn';
+                btnFolder.dataset.action = 'folder';
+                btnFolder.dataset.id = s.id;
+                btnFolder.textContent = 'Folder';
+
+                actions.appendChild(btnContinue);
+                actions.appendChild(btnFolder);
+
+                row.appendChild(main);
+                row.appendChild(actions);
+                list.appendChild(row);
+            }
+
+            list.onclick = (e) => {
+                const btn = e.target.closest('button[data-action]');
+                if (!btn) return;
+                const id = btn.dataset.id;
+                const action = btn.dataset.action;
+                if (!id) return;
+                if (action === 'continue') this._continueConversationSession(id);
+                if (action === 'folder') this._openConversationSessionFolder(id);
+            };
+        } catch (err) {
+            console.error('Failed to list conversations:', err);
+            list.innerHTML = '';
+            empty.style.display = 'block';
+            empty.textContent = 'Could not load history.';
+            if (pag) pag.hidden = true;
+            this._showToast('Failed to load conversation history', 'error');
+        }
+    }
+
+    async _continueConversationSession(sessionId) {
+        if (this.isRunning) {
+            this._showToast('Stop recording before loading a conversation.', 'info');
+            return;
+        }
+        try {
+            const content = await invoke('read_transcript_session', { sessionId });
+            this.transcriptUI.loadFromMarkdown(content);
+            this.currentSessionId = sessionId;
+            this._updateSummaryButtonState();
+            this._showView('overlay');
+            this._showToast('Conversation loaded — you can keep translating.', 'success');
+        } catch (err) {
+            console.error(err);
+            this._showToast('Failed to load: ' + err, 'error');
+        }
+    }
+
+    async _openConversationSessionFolder(sessionId) {
+        try {
+            await invoke('open_conversation_folder', { sessionId });
+        } catch (err) {
+            this._showToast('Failed to open folder: ' + err, 'error');
         }
     }
 
@@ -1444,24 +1725,11 @@ class App {
         this.isPinned = !this.isPinned;
         await this.appWindow.setAlwaysOnTop(this.isPinned);
         const btn = document.getElementById('btn-pin');
-        if (btn) btn.classList.toggle('active', this.isPinned);
-        this._showToast(this.isPinned ? 'Pinned on top' : 'Unpinned — window can go behind other apps', 'success');
-    }
-
-    // ─── Compact Mode ───────────────────────────────
-
-    _toggleCompact() {
-        this.isCompact = !this.isCompact;
-        const dragRegion = document.getElementById('drag-region');
-        const overlay = document.getElementById('overlay-view');
-
-        if (this.isCompact) {
-            dragRegion.classList.add('compact-hidden');
-            overlay.classList.add('compact-mode');
-        } else {
-            dragRegion.classList.remove('compact-hidden');
-            overlay.classList.remove('compact-mode');
+        if (btn) {
+            btn.classList.toggle('active', this.isPinned);
+            btn.setAttribute('aria-checked', this.isPinned ? 'true' : 'false');
         }
+        this._showToast(this.isPinned ? 'Pinned on top' : 'Unpinned — window can go behind other apps', 'success');
     }
 
     _toggleViewMode() {

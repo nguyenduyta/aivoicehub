@@ -242,6 +242,93 @@ export class TranscriptUI {
         this.contentEl = null;
     }
 
+    /**
+     * Restore segments from saved markdown (same format as getFormattedContent).
+     */
+    loadFromMarkdown(content) {
+        if (!content || typeof content !== 'string') return;
+
+        this.clear();
+
+        let body = content;
+        const t = content.trimStart();
+        if (t.startsWith('---')) {
+            const close = t.indexOf('\n---', 3);
+            if (close !== -1) {
+                body = t.slice(close + 4).replace(/^\s*/, '');
+            }
+        }
+
+        const lines = body.split('\n');
+        let i = 0;
+        let speaker = null;
+
+        while (i < lines.length) {
+            const line = lines[i];
+            const trimmed = line.trim();
+            if (!trimmed) {
+                i++;
+                continue;
+            }
+
+            const speakerMatch = trimmed.match(/^\*\*Speaker (\d+):\*\*\s*$/);
+            if (speakerMatch) {
+                speaker = parseInt(speakerMatch[1], 10);
+                i++;
+                continue;
+            }
+
+            if (trimmed.startsWith('>')) {
+                const original = trimmed.replace(/^>\s?/, '').trim();
+                i++;
+                const transLines = [];
+                while (i < lines.length) {
+                    const L = lines[i];
+                    const T = L.trim();
+                    if (!T) break;
+                    if (T.startsWith('>')) break;
+                    if (/^\*\*Speaker \d+:\*\*/.test(T)) break;
+                    transLines.push(L);
+                    i++;
+                }
+                if (i < lines.length && !lines[i].trim()) i++;
+
+                const translation = transLines.join('\n').trim();
+                this.segments.push({
+                    original: original || '',
+                    translation: translation || null,
+                    status: translation ? 'translated' : 'original',
+                    speaker,
+                    createdAt: Date.now(),
+                });
+                speaker = null;
+                continue;
+            }
+
+            // Translation-only line (no blockquote), or continuation
+            this.segments.push({
+                original: '',
+                translation: trimmed,
+                status: 'translated',
+                speaker,
+                createdAt: Date.now(),
+            });
+            speaker = null;
+            i++;
+        }
+
+        if (this.segments.length === 0) {
+            this.showPlaceholder();
+            return;
+        }
+
+        const last = this.segments[this.segments.length - 1];
+        if (last && last.speaker) this.currentSpeaker = last.speaker;
+
+        this._ensureContent();
+        this._render();
+    }
+
     // ─── Internal ──────────────────────────────────────────
 
     _ensureContent() {
