@@ -238,12 +238,18 @@ fn extract_preview(content: &str) -> String {
     truncate_chars(&collapsed, 200)
 }
 
-#[derive(Debug, Serialize, Deserialize)]
+#[derive(Debug, Serialize, Deserialize, Clone)]
 struct SessionMeta {
     id: String,
     created_at: i64,
     updated_at: i64,
     title: String,
+    /// User-visible notes; stored only locally in meta.json.
+    #[serde(default)]
+    notes: String,
+    /// When true, `save_transcript_session` does not overwrite `title` from transcript text.
+    #[serde(default)]
+    title_locked: bool,
 }
 
 #[derive(Debug, Serialize)]
@@ -260,6 +266,8 @@ pub struct ConversationSession {
     pub title: String,
     pub updated_at: i64,
     pub preview: String,
+    pub notes: String,
+    pub title_locked: bool,
 }
 
 #[derive(Debug, Serialize)]
@@ -282,6 +290,28 @@ pub struct ListConversationArgs {
     pub page_size: Option<u32>,
     #[serde(default)]
     pub search: Option<String>,
+}
+
+/// Update session display title / notes in meta.json (IPC: `{ args: { ... } }`).
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct UpdateSessionMetaArgs {
+    pub session_id: String,
+    pub title: Option<String>,
+    pub notes: Option<String>,
+    /// Recompute title from transcript.md and clear `title_locked`.
+    pub revert_title_to_auto: Option<bool>,
+}
+
+/// Returned by `get_session_meta` for History edit UI.
+#[derive(Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct SessionMetaView {
+    pub id: String,
+    pub title: String,
+    pub notes: String,
+    pub title_locked: bool,
+    pub updated_at: i64,
 }
 
 fn new_session_id() -> String {
@@ -333,7 +363,9 @@ pub fn save_transcript_session(
         )
         .map_err(|e| format!("meta.json parse: {}", e))?;
         m.updated_at = now;
-        m.title = title;
+        if !m.title_locked {
+            m.title = title;
+        }
         m
     } else {
         SessionMeta {
@@ -341,6 +373,8 @@ pub fn save_transcript_session(
             created_at: now,
             updated_at: now,
             title,
+            notes: String::new(),
+            title_locked: false,
         }
     };
 
@@ -380,30 +414,38 @@ fn collect_all_sessions(app: &AppHandle) -> Result<Vec<ConversationSession>, Str
         let id = entry.file_name().to_string_lossy().to_string();
         let meta_path = path.join("meta.json");
 
-        let (title, updated_at) = if meta_path.exists() {
+        let md_text = fs::read_to_string(&md).unwrap_or_default();
+        let (title, updated_at, notes, title_locked) = if meta_path.exists() {
             match fs::read_to_string(&meta_path) {
                 Ok(s) => match serde_json::from_str::<SessionMeta>(&s) {
-                    Ok(m) => (m.title, m.updated_at),
-                    Err(_) => (id.clone(), file_mtime_ms(&md)),
+                    Ok(m) => (m.title, m.updated_at, m.notes, m.title_locked),
+                    Err(_) => (
+                        id.clone(),
+                        file_mtime_ms(&md),
+                        String::new(),
+                        false,
+                    ),
                 },
-                Err(_) => (id.clone(), file_mtime_ms(&md)),
+                Err(_) => (id.clone(), file_mtime_ms(&md), String::new(), false),
             }
         } else {
             (
-                extract_title_from_transcript(
-                    &fs::read_to_string(&md).unwrap_or_default(),
-                ),
+                extract_title_from_transcript(&md_text),
                 file_mtime_ms(&md),
+                String::new(),
+                false,
             )
         };
 
-        let preview = extract_preview(&fs::read_to_string(&md).unwrap_or_default());
+        let preview = extract_preview(&md_text);
 
         out.push(ConversationSession {
             id,
             title,
             updated_at,
             preview,
+            notes,
+            title_locked,
         });
     }
 
@@ -436,6 +478,7 @@ pub fn list_conversation_sessions(
                 s.title.to_lowercase().contains(&q_lower)
                     || s.id.to_lowercase().contains(&q_lower)
                     || s.preview.to_lowercase().contains(&q_lower)
+                    || s.notes.to_lowercase().contains(&q_lower)
             });
         }
     }
@@ -463,6 +506,96 @@ pub fn list_conversation_sessions(
         page_size,
         total_pages,
     })
+}
+
+/// Load `meta.json` for one session (for History edit dialog).
+#[tauri::command]
+pub fn get_session_meta(app: AppHandle, session_id: String) -> Result<SessionMetaView, String> {
+    sanitize_session_id(&session_id)?;
+    let folder = sessions_root(&app)?.join(&session_id);
+    let md_path = folder.join("transcript.md");
+    if !md_path.exists() {
+        return Err("Session not found".to_string());
+    }
+    let meta_path = folder.join("meta.json");
+    let md_text = fs::read_to_string(&md_path).map_err(|e| e.to_string())?;
+
+    if meta_path.exists() {
+        let m: SessionMeta = serde_json::from_str(
+            &fs::read_to_string(&meta_path).map_err(|e| e.to_string())?,
+        )
+        .map_err(|e| format!("meta.json: {}", e))?;
+        return Ok(SessionMetaView {
+            id: m.id,
+            title: m.title,
+            notes: m.notes,
+            title_locked: m.title_locked,
+            updated_at: m.updated_at,
+        });
+    }
+
+    let now = file_mtime_ms(&md_path);
+    Ok(SessionMetaView {
+        id: session_id.clone(),
+        title: extract_title_from_transcript(&md_text),
+        notes: String::new(),
+        title_locked: false,
+        updated_at: now,
+    })
+}
+
+/// Edit display title and/or notes in `meta.json`. Title can be reverted to auto-extracted from markdown.
+#[tauri::command]
+pub fn update_session_meta(app: AppHandle, args: UpdateSessionMetaArgs) -> Result<(), String> {
+    sanitize_session_id(&args.session_id)?;
+    let folder = sessions_root(&app)?.join(&args.session_id);
+    let md_path = folder.join("transcript.md");
+    if !md_path.exists() {
+        return Err("Session not found".to_string());
+    }
+    let meta_path = folder.join("meta.json");
+    let now = chrono::Utc::now().timestamp_millis();
+    let md_text = fs::read_to_string(&md_path).map_err(|e| e.to_string())?;
+
+    let mut m: SessionMeta = if meta_path.exists() {
+        serde_json::from_str(&fs::read_to_string(&meta_path).map_err(|e| e.to_string())?)
+            .map_err(|e| format!("meta.json: {}", e))?
+    } else {
+        SessionMeta {
+            id: args.session_id.clone(),
+            created_at: now,
+            updated_at: now,
+            title: extract_title_from_transcript(&md_text),
+            notes: String::new(),
+            title_locked: false,
+        }
+    };
+
+    if args.revert_title_to_auto == Some(true) {
+        m.title = extract_title_from_transcript(&md_text);
+        m.title_locked = false;
+    } else if let Some(ref t) = args.title {
+        let trimmed = t.trim();
+        m.title = if trimmed.is_empty() {
+            m.id.clone()
+        } else {
+            trimmed.to_string()
+        };
+        m.title_locked = true;
+    }
+
+    if let Some(ref n) = args.notes {
+        m.notes = n.clone();
+    }
+
+    m.updated_at = now;
+
+    fs::write(
+        &meta_path,
+        serde_json::to_string_pretty(&m).map_err(|e| e.to_string())?,
+    )
+    .map_err(|e| format!("Failed to write meta: {}", e))?;
+    Ok(())
 }
 
 /// Read `transcript.md` for a session (for resume).

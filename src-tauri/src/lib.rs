@@ -45,6 +45,8 @@ pub fn run() {
             commands::transcript::read_transcript_session,
             commands::transcript::open_transcript_dir,
             commands::transcript::open_conversation_folder,
+            commands::transcript::update_session_meta,
+            commands::transcript::get_session_meta,
             commands::local_pipeline::start_local_pipeline,
             commands::local_pipeline::send_audio_to_pipeline,
             commands::local_pipeline::stop_local_pipeline,

@@ -19,7 +19,8 @@ Docs: [Install (macOS)](docs/installation_guide.md) · [Install (Windows)](docs/
 - **Two views**: Single (overlay) and Dual (source | translation).
 - **TTS narration** (optional): Edge (free), Google, ElevenLabs.
 - **Local mode** (Apple Silicon): offline pipeline using MLX (experimental).
-- **Transcripts saved locally** as Markdown: each session in its own folder under `transcripts/sessions/`; open **Conversation history** (clock icon) to resume.
+- **Transcripts saved locally** as Markdown: each session in its own folder under `transcripts/sessions/`; open **Conversation history** (clock icon) to resume, **rename**, add **notes** (`meta.json`), or search (title / notes / preview).
+- **Context presets** (Settings): quick domain hints for Soniox — meeting, interview, medical, tech, etc. (fully editable before save).
 
 ## Quickstart (local dev)
 

@@ -14,6 +14,25 @@ import { audioPlayer } from './audio-player.js';
 const { invoke } = window.__TAURI__.core;
 const { getCurrentWindow } = window.__TAURI__.window;
 
+/**
+ * Domain hints for Soniox — must match `value` in `#select-context-preset` (Settings → Context).
+ * Open-source: contributors can add presets here and in index.html.
+ */
+const CONTEXT_DOMAIN_PRESETS = {
+    meeting:
+        'Business meeting. Use clear, professional language; preserve names, acronyms, and product names.',
+    interview:
+        'Job or media interview. Keep questions and answers distinct; faithful wording.',
+    medical:
+        'Medical context. Prioritize accuracy for symptoms, medications, dosages, and units.',
+    legal: 'Legal or compliance discussion. Prefer precise terminology; do not add interpretation.',
+    education: 'Lecture or classroom. Educational and subject-matter terminology.',
+    tech: 'Technical / software discussion. Preserve API names, commands, version numbers, and code terms.',
+    support:
+        'Customer support call. Polite, solution-oriented tone; keep product and ticket identifiers.',
+    general: 'General conversation. Neutral, natural phrasing.',
+};
+
 class App {
     constructor() {
         this.isRunning = false;
@@ -36,6 +55,10 @@ class App {
         this.historySearchQuery = '';
         this._historyTotalPages = 0;
         this._historySearchDebounce = null;
+        /** History → Edit session meta (meta.json) */
+        this._sessionMetaEditId = null;
+        this._sessionMetaInitialTitle = '';
+        this._sessionMetaInitialNotes = '';
     }
 
     async init() {
@@ -143,6 +166,31 @@ class App {
                 this._refreshHistoryList();
             });
         }
+
+        const presetSelect = document.getElementById('select-context-preset');
+        if (presetSelect) {
+            presetSelect.addEventListener('change', () => {
+                const v = presetSelect.value;
+                if (!v) return;
+                const hint = CONTEXT_DOMAIN_PRESETS[v];
+                const input = document.getElementById('input-context-domain');
+                if (input && hint) input.value = hint;
+            });
+        }
+
+        document.getElementById('btn-session-meta-cancel')?.addEventListener('click', () => {
+            this._closeSessionMetaModal();
+        });
+        document.getElementById('btn-session-meta-save')?.addEventListener('click', () => {
+            this._saveSessionMeta();
+        });
+        document.getElementById('btn-session-meta-revert-title')?.addEventListener('click', () => {
+            this._revertSessionTitleFromTranscript();
+        });
+        document.getElementById('session-meta-modal')?.addEventListener('click', (e) => {
+            if (e.target?.id === 'session-meta-modal') this._closeSessionMetaModal();
+        });
+
         document.getElementById('history-page-prev')?.addEventListener('click', () => {
             if (this.historyPage <= 1) return;
             this.historyPage -= 1;
@@ -459,6 +507,17 @@ class App {
 
     _bindKeyboardShortcuts() {
         document.addEventListener('keydown', (e) => {
+            const sessionModal = document.getElementById('session-meta-modal');
+            if (
+                e.key === 'Escape' &&
+                sessionModal &&
+                sessionModal.style.display !== 'none'
+            ) {
+                e.preventDefault();
+                this._closeSessionMetaModal();
+                return;
+            }
+
             // Ignore when typing in input fields
             if (e.target.tagName === 'INPUT' || e.target.tagName === 'TEXTAREA') {
                 return;
@@ -543,6 +602,9 @@ class App {
         if (typeof this._closeMoreMenu === 'function') {
             this._closeMoreMenu();
         }
+        if (view !== 'history') {
+            this._closeSessionMetaModal();
+        }
 
         document.getElementById('overlay-view').classList.toggle('active', view === 'overlay');
         document.getElementById('settings-view').classList.toggle('active', view === 'settings');
@@ -623,7 +685,19 @@ class App {
 
         // Custom context
         const ctx = s.custom_context;
-        document.getElementById('input-context-domain').value = ctx?.domain || '';
+        const domain = ctx?.domain || '';
+        document.getElementById('input-context-domain').value = domain;
+        const presetSel = document.getElementById('select-context-preset');
+        if (presetSel) {
+            let matched = '';
+            for (const [k, text] of Object.entries(CONTEXT_DOMAIN_PRESETS)) {
+                if (text === domain) {
+                    matched = k;
+                    break;
+                }
+            }
+            presetSel.value = matched;
+        }
         // Load translation terms as rows
         const termsList = document.getElementById('translation-terms-list');
         if (termsList) {
@@ -1559,6 +1633,14 @@ class App {
                 titleEl.className = 'history-row-title';
                 titleEl.textContent = s.title || s.id;
 
+                const notesRaw = (s.notes ?? '').trim();
+                let notesEl = null;
+                if (notesRaw) {
+                    notesEl = document.createElement('div');
+                    notesEl.className = 'history-row-notes';
+                    notesEl.textContent = notesRaw;
+                }
+
                 const metaEl = document.createElement('div');
                 metaEl.className = 'history-row-meta';
                 const updatedAt = s.updatedAt ?? s.updated_at;
@@ -1572,6 +1654,7 @@ class App {
                 previewEl.textContent = s.preview || '';
 
                 main.appendChild(titleEl);
+                if (notesEl) main.appendChild(notesEl);
                 main.appendChild(metaEl);
                 main.appendChild(previewEl);
 
@@ -1585,6 +1668,13 @@ class App {
                 btnContinue.dataset.id = s.id;
                 btnContinue.textContent = 'Continue';
 
+                const btnEdit = document.createElement('button');
+                btnEdit.type = 'button';
+                btnEdit.className = 'history-btn';
+                btnEdit.dataset.action = 'edit-meta';
+                btnEdit.dataset.id = s.id;
+                btnEdit.textContent = 'Edit';
+
                 const btnFolder = document.createElement('button');
                 btnFolder.type = 'button';
                 btnFolder.className = 'history-btn';
@@ -1593,6 +1683,7 @@ class App {
                 btnFolder.textContent = 'Folder';
 
                 actions.appendChild(btnContinue);
+                actions.appendChild(btnEdit);
                 actions.appendChild(btnFolder);
 
                 row.appendChild(main);
@@ -1607,6 +1698,7 @@ class App {
                 const action = btn.dataset.action;
                 if (!id) return;
                 if (action === 'continue') this._continueConversationSession(id);
+                if (action === 'edit-meta') this._openSessionMetaModal(id);
                 if (action === 'folder') this._openConversationSessionFolder(id);
             };
         } catch (err) {
@@ -1642,6 +1734,80 @@ class App {
             await invoke('open_conversation_folder', { sessionId });
         } catch (err) {
             this._showToast('Failed to open folder: ' + err, 'error');
+        }
+    }
+
+    async _openSessionMetaModal(sessionId) {
+        try {
+            const meta = await invoke('get_session_meta', { sessionId });
+            this._sessionMetaEditId = sessionId;
+            this._sessionMetaInitialTitle = meta.title ?? '';
+            this._sessionMetaInitialNotes = meta.notes ?? '';
+            const titleInput = document.getElementById('session-meta-title');
+            const notesInput = document.getElementById('session-meta-notes');
+            const modal = document.getElementById('session-meta-modal');
+            if (titleInput) titleInput.value = meta.title || '';
+            if (notesInput) notesInput.value = meta.notes || '';
+            if (modal) modal.style.display = 'flex';
+        } catch (err) {
+            console.error(err);
+            this._showToast('Failed to load session: ' + err, 'error');
+        }
+    }
+
+    _closeSessionMetaModal() {
+        const modal = document.getElementById('session-meta-modal');
+        if (modal) modal.style.display = 'none';
+        this._sessionMetaEditId = null;
+        this._sessionMetaInitialTitle = '';
+        this._sessionMetaInitialNotes = '';
+    }
+
+    async _saveSessionMeta() {
+        const id = this._sessionMetaEditId;
+        if (!id) return;
+        const titleEl = document.getElementById('session-meta-title');
+        const notesEl = document.getElementById('session-meta-notes');
+        const titleNow = (titleEl?.value ?? '').trim();
+        const notesNow = notesEl?.value ?? '';
+        const args = { sessionId: id };
+        if (titleNow !== this._sessionMetaInitialTitle) {
+            args.title = titleNow;
+        }
+        if (notesNow !== this._sessionMetaInitialNotes) {
+            args.notes = notesNow;
+        }
+        if (args.title === undefined && args.notes === undefined) {
+            this._closeSessionMetaModal();
+            return;
+        }
+        try {
+            await invoke('update_session_meta', { args });
+            this._closeSessionMetaModal();
+            await this._refreshHistoryList();
+            this._showToast('Session saved', 'success');
+        } catch (err) {
+            console.error(err);
+            this._showToast('Failed to save: ' + err, 'error');
+        }
+    }
+
+    async _revertSessionTitleFromTranscript() {
+        const id = this._sessionMetaEditId;
+        if (!id) return;
+        try {
+            await invoke('update_session_meta', {
+                args: { sessionId: id, revertTitleToAuto: true },
+            });
+            const meta = await invoke('get_session_meta', { sessionId: id });
+            this._sessionMetaInitialTitle = meta.title ?? '';
+            const titleInput = document.getElementById('session-meta-title');
+            if (titleInput) titleInput.value = meta.title || '';
+            await this._refreshHistoryList();
+            this._showToast('Title matched to transcript', 'success');
+        } catch (err) {
+            console.error(err);
+            this._showToast('Failed to update title: ' + err, 'error');
         }
     }
 

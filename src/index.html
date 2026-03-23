@@ -270,6 +270,21 @@
 
         <div class="settings-section">
           <span class="field-label">Context <span class="optional-badge">Optional</span></span>
+          <div class="context-preset-row">
+            <label class="field-label subtle" for="select-context-preset">Quick preset</label>
+            <select id="select-context-preset" class="context-preset-select">
+              <option value="">— Custom (type below) —</option>
+              <option value="meeting">Meeting</option>
+              <option value="interview">Interview</option>
+              <option value="medical">Medical</option>
+              <option value="legal">Legal</option>
+              <option value="education">Education</option>
+              <option value="tech">Tech / software</option>
+              <option value="support">Customer support</option>
+              <option value="general">General conversation</option>
+            </select>
+            <p class="hint context-preset-hint">Fills the domain line for Soniox; edit freely. Saved with <strong>Save &amp; Close</strong>.</p>
+          </div>
           <input type="text" id="input-context-domain" placeholder="e.g. Catholic sermon, Tech meeting..." style="margin-bottom: 8px;" />
           <div class="terms-header">
             <span class="hint" style="margin:0;">Translation terms</span>
@@ -450,6 +465,29 @@
         <button type="button" id="history-page-next" class="history-page-btn">Next</button>
       </div>
       <div id="history-empty" class="history-empty" style="display:none">No saved conversations yet. Stop recording or clear to save.</div>
+    </div>
+  </div>
+
+  <!-- Session title / notes (meta.json) — History -->
+  <div id="session-meta-modal" class="modal-overlay" style="display:none" role="dialog" aria-modal="true" aria-labelledby="session-meta-heading">
+    <div class="modal-card session-meta-card">
+      <div class="modal-header">
+        <h3 id="session-meta-heading">Session details</h3>
+      </div>
+      <div class="modal-body">
+        <label class="field-label" for="session-meta-title">Title</label>
+        <input type="text" id="session-meta-title" class="session-meta-input" autocomplete="off" />
+        <button type="button" id="btn-session-meta-revert-title" class="secondary-btn session-meta-revert-btn">
+          Use auto-generated title
+        </button>
+        <label class="field-label" for="session-meta-notes" style="margin-top: 12px;">Notes <span class="optional-badge">Optional</span></label>
+        <textarea id="session-meta-notes" class="session-meta-notes" rows="4" placeholder="Private notes — stored only in meta.json on this device."></textarea>
+        <p class="hint session-meta-privacy-hint">Title and notes are not sent to Soniox or other APIs unless you paste them into Context in Settings.</p>
+      </div>
+      <div class="modal-footer">
+        <button type="button" id="btn-session-meta-cancel" class="secondary-btn">Cancel</button>
+        <button type="button" id="btn-session-meta-save" class="primary-btn">Save</button>
+      </div>
     </div>
   </div>
 

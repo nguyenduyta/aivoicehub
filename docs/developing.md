@@ -40,3 +40,14 @@ From the repository root (e.g. `aivoicehub/` after clone):
 3. In **Settings**, add your **Soniox** API key (cloud mode). For **Local MLX** (Apple Silicon only), follow the in-app one-time model setup.
 
 Optional — **Summary (ChatGPT)**: set **OpenAI API key** in Settings or export `OPENAI_API_KEY` before starting the app.
+
+## Session files (`transcripts/sessions/`)
+
+Each conversation folder contains:
+
+| File | Purpose |
+|------|---------|
+| `transcript.md` | Saved transcript (Markdown). |
+| `meta.json` | Local metadata: `title`, optional `notes`, `title_locked` (if the user renamed the session in History — auto title from transcript won’t overwrite it until reverted), timestamps. |
+
+**Context presets** (Settings → Quick preset) map to the same domain strings as in `src/js/app.js` (`CONTEXT_DOMAIN_PRESETS`) and `index.html` (`#select-context-preset`). Add new options in both places for contributors.
