@@ -12,7 +12,7 @@ use std::sync::Mutex;
 #[tauri::command]
 fn get_platform_info() -> String {
     format!(
-        r#"{{"os":"{}","arch":"{}","version":"0.4.5"}}"#,
+        r#"{{"os":"{}","arch":"{}","version":"0.5.0"}}"#,
         std::env::consts::OS,
         std::env::consts::ARCH
     )
@@ -54,6 +54,12 @@ pub fn run() {
             commands::local_pipeline::run_mlx_setup,
             commands::edge_tts::edge_tts_speak,
             commands::summary::summarize_transcript,
+            commands::summary::summarize_meeting,
+            commands::meeting::export_meeting_note,
+            commands::meeting::get_mtg_dir_info,
+            commands::meeting::open_mtg_location,
+            commands::calendar::get_calendar_events,
+            commands::calendar::test_calendar_feed,
             get_platform_info,
         ])
         .run(tauri::generate_context!())

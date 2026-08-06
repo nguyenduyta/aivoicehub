@@ -10,6 +10,8 @@ import { elevenLabsTTS } from './elevenlabs-tts.js';
 import { googleTTS } from './google-tts.js';
 import { edgeTTSRust } from './edge-tts.js';
 import { audioPlayer } from './audio-player.js';
+import { CalendarPanel } from './calendar.js';
+import { MeetingNoteDialog } from './meeting-note.js';
 
 const { invoke } = window.__TAURI__.core;
 const { getCurrentWindow } = window.__TAURI__.window;
@@ -59,6 +61,19 @@ class App {
         this._sessionMetaEditId = null;
         this._sessionMetaInitialTitle = '';
         this._sessionMetaInitialNotes = '';
+        /** Calendar agenda + MTG note export */
+        this.calendarPanel = null;
+        this.meetingNote = null;
+        /**
+         * Meeting this session is attached to, set when started from the agenda:
+         * `{ title, meetingUrl, uid, start, end, calendar }`. Feeds the MTG note and the
+         * transcript front matter.
+         */
+        this.activeMeeting = null;
+        /** Epoch ms when recording last stopped — the meeting's end time in the note. */
+        this.recordingEndTime = null;
+        /** True during an audio-source switch, so stop() knows the meeting isn't over. */
+        this._switchingSource = false;
     }
 
     async init() {
@@ -84,6 +99,18 @@ class App {
         // Subscribe to settings changes
         settingsManager.onChange((settings) => this._applySettings(settings));
 
+        // Calendar agenda + meeting-note dialog
+        this.calendarPanel = new CalendarPanel({
+            onStart: (ev) => this._startMeetingFromCalendar(ev),
+            onToast: (msg, kind) => this._showToast(msg, kind),
+            onOpenSettings: () => this._showView('settings'),
+        });
+        this.meetingNote = new MeetingNoteDialog({
+            onToast: (msg, kind) => this._showToast(msg, kind),
+            getSettings: () => settingsManager.get(),
+            onOpenSettings: () => this._showView('settings'),
+        });
+
         // Init audio player for TTS
         audioPlayer.init();
 
@@ -103,7 +130,7 @@ class App {
         // Window position restore disabled — causes issues on Retina displays
         // await this._restoreWindowPosition();
 
-        console.log('🌐 AIVoiceHub v0.4.5 initialized');
+        console.log('🌐 AIVoiceHub v0.5.0 initialized');
     }
 
     async _checkPlatformSupport() {
@@ -136,6 +163,73 @@ class App {
     // ─── Event Binding ──────────────────────────────────────
 
     _bindEvents() {
+        // Calendar / meetings
+        document.getElementById('btn-calendar')?.addEventListener('click', () => {
+            this._showView('calendar');
+        });
+        document.getElementById('btn-calendar-back')?.addEventListener('click', () => {
+            this._showView('overlay');
+        });
+
+        // Meeting note (MTG)
+        document.getElementById('btn-meeting-note')?.addEventListener('click', () => {
+            this._openMeetingNoteDialog();
+        });
+
+        // Active meeting bar
+        document.getElementById('btn-clear-active-meeting')?.addEventListener('click', () => {
+            this.activeMeeting = null;
+            this._updateActiveMeetingBar();
+            this._showToast('Meeting detached from this session', 'info');
+        });
+        document.getElementById('active-meeting-link')?.addEventListener('click', async (e) => {
+            e.preventDefault();
+            const url = this.activeMeeting?.meetingUrl;
+            if (!url) return;
+            try {
+                await window.__TAURI__.opener.openUrl(url);
+            } catch (err) {
+                this._showToast('Could not open the link: ' + err, 'error');
+            }
+        });
+
+        // Settings → Meeting
+        document.getElementById('btn-open-mtg-dir')?.addEventListener('click', async () => {
+            // Save first so the folder just typed is the one that gets opened.
+            const typed = document.getElementById('input-mtg-dir')?.value?.trim() ?? '';
+            try {
+                if (typed !== (settingsManager.get().mtg_export_dir || '')) {
+                    await settingsManager.save({ mtg_export_dir: typed });
+                }
+                await invoke('open_mtg_location', { path: null });
+            } catch (err) {
+                this._showToast('Could not open the folder: ' + err, 'error');
+            }
+        });
+        document.getElementById('input-mtg-dir')?.addEventListener('input', () => {
+            this._refreshMtgSampleHint();
+        });
+        document.getElementById('select-mtg-layout')?.addEventListener('change', () => {
+            this._refreshMtgSampleHint();
+        });
+        document.getElementById('input-mtg-prefix')?.addEventListener('input', () => {
+            this._refreshMtgSampleHint();
+        });
+
+        // Settings → Calendar
+        document.getElementById('btn-add-feed')?.addEventListener('click', () => {
+            this._addFeedRow({ label: '', url: '', enabled: true });
+        });
+        document.getElementById('range-calendar-days')?.addEventListener('input', (e) => {
+            const el = document.getElementById('calendar-days-value');
+            if (el) el.textContent = e.target.value;
+        });
+        document.getElementById('range-calendar-refresh')?.addEventListener('input', (e) => {
+            const el = document.getElementById('calendar-refresh-value');
+            const v = parseInt(e.target.value, 10);
+            if (el) el.textContent = v === 0 ? 'off' : `${v}m`;
+        });
+
         // Conversation history
         document.getElementById('btn-history')?.addEventListener('click', () => {
             this._showView('history');
@@ -359,6 +453,16 @@ class App {
             }
         });
 
+        document.getElementById('calendar-view')?.addEventListener('mousedown', (e) => {
+            const interactive = e.target.closest(
+                'button, input, select, label, textarea, a, .calendar-list, .calendar-row, .history-btn, .calendar-status',
+            );
+            if (!interactive && e.buttons === 1) {
+                e.preventDefault();
+                this.appWindow.startDragging();
+            }
+        });
+
         this._setupMacMoreMenu();
 
         // Toggle API key visibility
@@ -518,6 +622,12 @@ class App {
                 return;
             }
 
+            if (e.key === 'Escape' && this.meetingNote?.isOpen) {
+                e.preventDefault();
+                this.meetingNote.close();
+                return;
+            }
+
             // Ignore when typing in input fields
             if (e.target.tagName === 'INPUT' || e.target.tagName === 'TEXTAREA') {
                 return;
@@ -550,8 +660,10 @@ class App {
             // Escape: Go back to overlay / close settings
             if (e.key === 'Escape') {
                 e.preventDefault();
-                const settingsVisible = document.getElementById('settings-view').classList.contains('active');
-                if (settingsVisible) {
+                const onSubView = ['settings-view', 'calendar-view', 'history-view'].some((id) =>
+                    document.getElementById(id)?.classList.contains('active'),
+                );
+                if (onSubView) {
                     this._showView('overlay');
                 }
             }
@@ -609,12 +721,20 @@ class App {
         document.getElementById('overlay-view').classList.toggle('active', view === 'overlay');
         document.getElementById('settings-view').classList.toggle('active', view === 'settings');
         document.getElementById('history-view')?.classList.toggle('active', view === 'history');
+        document.getElementById('calendar-view')?.classList.toggle('active', view === 'calendar');
 
         if (view === 'settings') {
             this._populateSettingsForm();
         }
         if (view === 'history') {
             this._refreshHistoryList();
+        }
+
+        // Only poll the calendar while its view is on screen.
+        if (view === 'calendar') {
+            this.calendarPanel?.onShow(settingsManager.get().calendar_refresh_minutes);
+        } else {
+            this.calendarPanel?.onHide();
         }
     }
 
@@ -735,6 +855,190 @@ class App {
             providerSelect.value = s.tts_provider || 'edge';
             this._updateTTSProviderUI(providerSelect.value);
         }
+
+        // ─── Meeting (MTG) ──────────────────────────────────
+        const setVal = (id, value) => {
+            const el = document.getElementById(id);
+            if (el) el.value = value;
+        };
+        const setChecked = (id, value) => {
+            const el = document.getElementById(id);
+            if (el) el.checked = !!value;
+        };
+
+        setVal('input-mtg-dir', s.mtg_export_dir || '');
+        setVal('select-mtg-layout', s.mtg_folder_layout || 'year_month');
+        setVal('input-mtg-prefix', s.mtg_filename_prefix || 'mtg');
+        setChecked('check-mtg-include-transcript', s.mtg_include_transcript !== false);
+        setChecked('check-mtg-include-original', s.mtg_include_original === true);
+        setChecked('check-mtg-auto-export', s.mtg_auto_export === true);
+        setVal('select-mtg-language', s.mtg_summary_language || 'vi');
+        setVal('input-mtg-model', s.mtg_summary_model || 'gpt-4o-mini');
+        setVal('input-mtg-prompt', s.mtg_summary_prompt || '');
+        this._refreshMtgSampleHint();
+
+        // ─── Calendar ───────────────────────────────────────
+        const feedsList = document.getElementById('calendar-feeds-list');
+        if (feedsList) {
+            feedsList.innerHTML = '';
+            const feeds = Array.isArray(s.calendar_feeds) ? s.calendar_feeds : [];
+            feeds.forEach((f) => this._addFeedRow(f));
+        }
+
+        const daysSlider = document.getElementById('range-calendar-days');
+        const daysLabel = document.getElementById('calendar-days-value');
+        const days = s.calendar_days_ahead ?? 7;
+        if (daysSlider) daysSlider.value = days;
+        if (daysLabel) daysLabel.textContent = days;
+
+        const refreshSlider = document.getElementById('range-calendar-refresh');
+        const refreshLabel = document.getElementById('calendar-refresh-value');
+        const refreshMins = s.calendar_refresh_minutes ?? 15;
+        if (refreshSlider) refreshSlider.value = refreshMins;
+        if (refreshLabel) refreshLabel.textContent = refreshMins === 0 ? 'off' : `${refreshMins}m`;
+
+        setChecked('check-calendar-only-meet', s.calendar_only_with_meet === true);
+        setChecked('check-calendar-open-link', s.calendar_open_link_on_start !== false);
+        setVal('input-calendar-tz', s.calendar_timezone || '');
+    }
+
+    /**
+     * Show where the next MTG note would land, so the folder setting isn't guesswork.
+     *
+     * Built from the *typed* values rather than the saved ones — the preview is most useful
+     * while editing, before Save has happened. Only the "empty = app data folder" case asks
+     * Rust, since that path is not knowable here.
+     */
+    async _refreshMtgSampleHint() {
+        const hint = document.getElementById('hint-mtg-sample');
+        if (!hint) return;
+
+        const dir = document.getElementById('input-mtg-dir')?.value.trim() || '';
+        const layout = document.getElementById('select-mtg-layout')?.value || 'year_month';
+        const prefix = document.getElementById('input-mtg-prefix')?.value.trim() || 'mtg';
+
+        if (!dir) {
+            try {
+                const info = await invoke('get_mtg_dir_info');
+                hint.textContent = info?.error
+                    ? `⚠ ${info.error}`
+                    : `Next note: ${info?.samplePath || info?.dir || ''} (app data folder — set a path above)`;
+            } catch {
+                hint.textContent = '';
+            }
+            return;
+        }
+
+        if (!dir.startsWith('/') && !dir.startsWith('~')) {
+            hint.textContent = '⚠ Use an absolute path (starting with / or ~).';
+            return;
+        }
+        if (dir.split('/').includes('..')) {
+            hint.textContent = '⚠ The path must not contain "..".';
+            return;
+        }
+
+        const now = new Date();
+        const yyyy = now.getFullYear();
+        const mm = String(now.getMonth() + 1).padStart(2, '0');
+        const dd = String(now.getDate()).padStart(2, '0');
+        const base = dir.replace(/\/+$/, '');
+        const folder = layout === 'flat' ? base : `${base}/${yyyy}/${mm}`;
+        hint.textContent = `Next note: ${folder}/${prefix}-${yyyy}-${mm}-${dd}-weekly-sync.md`;
+    }
+
+    /** One editable row in Settings → Calendar → Subscribed calendars. */
+    _addFeedRow({ label = '', url = '', enabled = true } = {}) {
+        const list = document.getElementById('calendar-feeds-list');
+        if (!list) return;
+
+        const row = document.createElement('div');
+        row.className = 'feed-row';
+
+        const check = document.createElement('input');
+        check.type = 'checkbox';
+        check.className = 'feed-enabled';
+        check.checked = !!enabled;
+        check.title = 'Include this calendar';
+
+        const inputs = document.createElement('div');
+        inputs.className = 'feed-row-inputs';
+
+        const labelInput = document.createElement('input');
+        labelInput.type = 'text';
+        labelInput.className = 'feed-label';
+        labelInput.placeholder = 'Label (optional) — e.g. Work';
+        labelInput.value = label;
+
+        const urlInput = document.createElement('input');
+        urlInput.type = 'text';
+        urlInput.className = 'feed-url';
+        urlInput.placeholder = 'https://calendar.google.com/calendar/ical/…/basic.ics';
+        urlInput.spellcheck = false;
+        urlInput.value = url;
+
+        const result = document.createElement('div');
+        result.className = 'feed-test-result';
+
+        inputs.appendChild(labelInput);
+        inputs.appendChild(urlInput);
+        inputs.appendChild(result);
+
+        const actions = document.createElement('div');
+        actions.className = 'feed-row-actions';
+
+        const btnTest = document.createElement('button');
+        btnTest.type = 'button';
+        btnTest.className = 'btn-test-feed';
+        btnTest.textContent = 'Test';
+        btnTest.addEventListener('click', async () => {
+            const u = urlInput.value.trim();
+            if (!u) {
+                result.className = 'feed-test-result err';
+                result.textContent = 'Paste the iCal URL first.';
+                return;
+            }
+            btnTest.disabled = true;
+            btnTest.textContent = '…';
+            result.className = 'feed-test-result';
+            result.textContent = 'Checking…';
+            try {
+                const res = await invoke('test_calendar_feed', { url: u });
+                if (res?.ok) {
+                    result.className = 'feed-test-result ok';
+                    result.textContent = `✓ ${res.calendarName || 'calendar'} — ${
+                        res.eventCount
+                    } entries, ${res.upcomingCount} in the next 7 days`;
+                    if (!labelInput.value.trim() && res.calendarName) {
+                        labelInput.value = res.calendarName;
+                    }
+                } else {
+                    result.className = 'feed-test-result err';
+                    result.textContent = `✕ ${res?.error || 'failed'}`;
+                }
+            } catch (err) {
+                result.className = 'feed-test-result err';
+                result.textContent = `✕ ${err}`;
+            } finally {
+                btnTest.disabled = false;
+                btnTest.textContent = 'Test';
+            }
+        });
+
+        const btnRemove = document.createElement('button');
+        btnRemove.type = 'button';
+        btnRemove.className = 'btn-remove-feed';
+        btnRemove.textContent = '×';
+        btnRemove.title = 'Remove';
+        btnRemove.addEventListener('click', () => row.remove());
+
+        actions.appendChild(btnTest);
+        actions.appendChild(btnRemove);
+
+        row.appendChild(check);
+        row.appendChild(inputs);
+        row.appendChild(actions);
+        list.appendChild(row);
     }
 
     async _saveSettingsFromForm() {
@@ -779,6 +1083,52 @@ class App {
         settings.google_tts_voice = document.getElementById('select-google-voice')?.value || 'vi-VN-Chirp3-HD-Aoede';
         settings.google_tts_speed = parseFloat(document.getElementById('range-google-speed')?.value || 1.0);
         settings.tts_enabled = false;
+
+        // Meeting (MTG) note export
+        settings.mtg_export_dir = document.getElementById('input-mtg-dir')?.value.trim() || '';
+        settings.mtg_folder_layout =
+            document.getElementById('select-mtg-layout')?.value || 'year_month';
+        settings.mtg_filename_prefix =
+            document.getElementById('input-mtg-prefix')?.value.trim() || 'mtg';
+        settings.mtg_include_transcript =
+            document.getElementById('check-mtg-include-transcript')?.checked !== false;
+        settings.mtg_include_original =
+            document.getElementById('check-mtg-include-original')?.checked === true;
+        settings.mtg_auto_export =
+            document.getElementById('check-mtg-auto-export')?.checked === true;
+        settings.mtg_summary_language =
+            document.getElementById('select-mtg-language')?.value || 'vi';
+        settings.mtg_summary_model =
+            document.getElementById('input-mtg-model')?.value.trim() || 'gpt-4o-mini';
+        settings.mtg_summary_prompt = document.getElementById('input-mtg-prompt')?.value || '';
+
+        // Calendar subscription — drop rows with no URL so an empty "+" row isn't persisted.
+        const feeds = [];
+        document.querySelectorAll('#calendar-feeds-list .feed-row').forEach((row) => {
+            const url = row.querySelector('.feed-url')?.value.trim() || '';
+            if (!url) return;
+            feeds.push({
+                label: row.querySelector('.feed-label')?.value.trim() || '',
+                url,
+                enabled: row.querySelector('.feed-enabled')?.checked !== false,
+            });
+        });
+        settings.calendar_source = 'ics';
+        settings.calendar_feeds = feeds;
+        settings.calendar_days_ahead = parseInt(
+            document.getElementById('range-calendar-days')?.value || 7,
+            10,
+        );
+        settings.calendar_refresh_minutes = parseInt(
+            document.getElementById('range-calendar-refresh')?.value || 15,
+            10,
+        );
+        settings.calendar_only_with_meet =
+            document.getElementById('check-calendar-only-meet')?.checked === true;
+        settings.calendar_open_link_on_start =
+            document.getElementById('check-calendar-open-link')?.checked !== false;
+        settings.calendar_timezone =
+            document.getElementById('input-calendar-tz')?.value.trim() || '';
 
         try {
             await settingsManager.save(settings);
@@ -938,11 +1288,16 @@ class App {
 
         // If currently running, restart with new source
         if (wasRunning) {
+            // Switching source stops and restarts capture. That is not the end of the meeting, so
+            // suppress the auto-export in stop() — otherwise a half-finished MTG note gets written.
+            this._switchingSource = true;
             this.stop().then(() => {
                 this.currentSource = source;
                 this._updateSourceButtons();
                 this._showToast(`Switched to ${source === 'system' ? 'System Audio' : 'Microphone'}`, 'success');
-                this.start();
+                return this.start();
+            }).finally(() => {
+                this._switchingSource = false;
             });
         } else {
             this.currentSource = source;
@@ -1313,7 +1668,9 @@ class App {
     }
 
     async stop() {
+        const wasRunning = this.isRunning;
         this.isRunning = false;
+        if (wasRunning) this.recordingEndTime = Date.now();
         this._updateStartButton();
 
         // Stop audio capture
@@ -1353,6 +1710,16 @@ class App {
         }
 
         this._updateSummaryButtonState();
+
+        // Optional: write the MTG note without further interaction.
+        if (
+            settingsManager.get().mtg_auto_export &&
+            !this._switchingSource &&
+            this.transcriptUI.hasSegments()
+        ) {
+            this._showToast('Writing meeting note…', 'success');
+            await this.meetingNote?.autoExport(this._buildMeetingContext());
+        }
     }
 
     _updateStartButton() {
@@ -1368,11 +1735,17 @@ class App {
     }
 
     _updateSummaryButtonState() {
-        const btn = document.getElementById('btn-summary');
-        if (!btn) return;
         const hasText = !!this.transcriptUI?.getPlainText()?.trim();
-        btn.disabled = this.isRunning || this.isStarting || this.isSummarizing || !hasText;
-        btn.classList.toggle('active', !btn.disabled);
+        const blocked = this.isRunning || this.isStarting || this.isSummarizing || !hasText;
+
+        const btn = document.getElementById('btn-summary');
+        if (btn) {
+            btn.disabled = blocked;
+            btn.classList.toggle('active', !btn.disabled);
+        }
+
+        const mtgBtn = document.getElementById('btn-meeting-note');
+        if (mtgBtn) mtgBtn.disabled = blocked;
     }
 
     async _summarizeTranscript() {
@@ -1523,6 +1896,8 @@ class App {
             targetLang,
             duration,
             audioSource: this.currentSource,
+            meetingTitle: this.activeMeeting?.title || '',
+            meetingUrl: this.activeMeeting?.meetingUrl || '',
         });
 
         if (!content) return;
@@ -1553,10 +1928,133 @@ class App {
         this.transcriptUI.clear();
         this.transcriptUI.showPlaceholder();
         this.recordingStartTime = null;
+        this.recordingEndTime = null;
         this.currentSessionId = null;
+        this.activeMeeting = null;
+        this._updateActiveMeetingBar();
         this._updateSummaryButtonState();
         this._showView('overlay');
         this._showToast('New conversation — previous text saved.', 'success');
+    }
+
+    // ─── Meetings (calendar → session → MTG note) ─────────────
+
+    /**
+     * Attach a calendar event to a fresh session and start capturing.
+     *
+     * Anything already on screen is saved into its own conversation first, so one meeting's
+     * transcript never bleeds into the next one's note.
+     */
+    async _startMeetingFromCalendar(ev) {
+        if (this.isRunning) {
+            this._showToast('Stop the current recording first.', 'info');
+            return;
+        }
+        if (!ev) return;
+
+        if (this.transcriptUI.hasSegments()) {
+            await this._saveTranscriptFile();
+            this.transcriptUI.clear();
+            this.transcriptUI.showPlaceholder();
+            this.currentSessionId = null;
+            this.recordingStartTime = null;
+        }
+
+        this.activeMeeting = {
+            uid: ev.uid || '',
+            title: ev.title || '',
+            meetingUrl: ev.meetingUrl || '',
+            start: ev.start ?? null,
+            end: ev.end ?? null,
+            calendar: ev.calendar || '',
+        };
+        this.recordingEndTime = null;
+        this._updateActiveMeetingBar();
+
+        const settings = settingsManager.get();
+        if (settings.calendar_open_link_on_start && ev.meetingUrl) {
+            try {
+                await window.__TAURI__.opener.openUrl(ev.meetingUrl);
+            } catch (err) {
+                console.error('[Meeting] could not open link:', err);
+            }
+        }
+
+        this._showView('overlay');
+        try {
+            this.isStarting = true;
+            await this.start();
+            // `start()` bails out quietly (toast + jump to Settings) when a key is missing, so
+            // claiming success here without checking would be a lie.
+            if (this.isRunning) {
+                this._showToast(`Recording “${this.activeMeeting.title}”`, 'success');
+            }
+        } catch (err) {
+            console.error('[Meeting] start failed:', err);
+            this._showToast(`Error: ${err}`, 'error');
+            this.isRunning = false;
+            this._updateStartButton();
+            this._updateStatus('error');
+        } finally {
+            this.isStarting = false;
+        }
+    }
+
+    _updateActiveMeetingBar() {
+        const bar = document.getElementById('active-meeting-bar');
+        const titleEl = document.getElementById('active-meeting-title');
+        const linkEl = document.getElementById('active-meeting-link');
+        if (!bar) return;
+
+        if (!this.activeMeeting) {
+            bar.hidden = true;
+            return;
+        }
+        bar.hidden = false;
+        if (titleEl) titleEl.textContent = this.activeMeeting.title || 'Meeting';
+        if (linkEl) linkEl.hidden = !this.activeMeeting.meetingUrl;
+    }
+
+    /** Everything `export_meeting_note` / `summarize_meeting` need about this session. */
+    _buildMeetingContext() {
+        const startedAt = this.recordingStartTime ?? null;
+        const endedAt = this.recordingEndTime ?? (this.isRunning ? null : Date.now());
+        const duration =
+            startedAt && endedAt ? this._formatDuration(endedAt - startedAt) : null;
+        const stats = this.transcriptUI?.getStats?.() ?? { segments: 0 };
+
+        return {
+            title: this.activeMeeting?.title || '',
+            meetingUrl: this.activeMeeting?.meetingUrl || '',
+            startedAt,
+            endedAt,
+            durationLabel: duration,
+            sourceLanguage:
+                document.getElementById('select-source-lang')?.value ||
+                settingsManager.get().source_language ||
+                '',
+            targetLanguage:
+                document.getElementById('select-target-lang')?.value ||
+                settingsManager.get().target_language ||
+                '',
+            sessionId: this.currentSessionId || '',
+            segmentCount: stats.segments,
+            // Full session, not the trimmed display buffer.
+            transcript: this.transcriptUI?.getSummaryText?.() || '',
+            transcriptWithOriginal: this.transcriptUI?.getFormattedContent?.({}) || '',
+        };
+    }
+
+    _openMeetingNoteDialog() {
+        if (this.isRunning) {
+            this._showToast('Stop the recording first, then write the note.', 'info');
+            return;
+        }
+        if (!this.transcriptUI?.hasSegments()) {
+            this._showToast('No transcript yet.', 'info');
+            return;
+        }
+        this.meetingNote?.open(this._buildMeetingContext());
     }
 
     async _refreshHistoryList() {

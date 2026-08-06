@@ -25,6 +25,29 @@ const DEFAULT_SETTINGS = {
   edge_tts_voice: 'vi-VN-HoaiMyNeural',
   edge_tts_speed: 50,
   tts_auto_read: true,
+  google_tts_api_key: '',
+  google_tts_voice: 'vi-VN-Chirp3-HD-Aoede',
+  google_tts_speed: 1.0,
+
+  // Meeting notes (MTG) — keep in sync with `Settings` in src-tauri/src/settings.rs
+  mtg_export_dir: '',
+  mtg_folder_layout: 'year_month',
+  mtg_filename_prefix: 'mtg',
+  mtg_include_transcript: true,
+  mtg_include_original: false,
+  mtg_auto_export: false,
+  mtg_summary_language: 'vi',
+  mtg_summary_prompt: '',
+  mtg_summary_model: 'gpt-4o-mini',
+
+  // Calendar subscription
+  calendar_source: 'ics',
+  calendar_feeds: [],
+  calendar_days_ahead: 7,
+  calendar_refresh_minutes: 15,
+  calendar_only_with_meet: false,
+  calendar_timezone: '',
+  calendar_open_link_on_start: true,
 };
 
 class SettingsManager {

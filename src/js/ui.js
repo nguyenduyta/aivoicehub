@@ -1,12 +1,25 @@
 /**
  * Transcript UI — continuous paragraph flow display with speaker diarization
- * 
+ *
  * Design: All text flows as one continuous paragraph.
  * - Translated text: white (primary color)
- * - Original text (pending translation): cyan/accent color  
+ * - Original text (pending translation): cyan/accent color
  * - Provisional text (being recognized): dimmed
  * - Speaker labels: shown when speaker changes (e.g. "Speaker 1:")
+ *
+ * Two buffers, one set of segment objects
+ * ---------------------------------------
+ * `segments` is the *display* buffer — trimmed to `maxChars` and pruned of stale
+ * originals so the overlay stays readable. `fullSegments` is the *record*: strictly
+ * append-only, never trimmed. Both hold the **same object references**, so a
+ * translation arriving late mutates the segment in place and shows up in both.
+ *
+ * Everything that persists or summarizes (save, copy, summary, MTG export) must read
+ * `fullSegments` — reading `segments` would capture only the tail of a meeting.
  */
+
+/** A pending original stops accepting translations after this long (see `_sealStaleOriginals`). */
+const TRANSLATION_BIND_WINDOW_MS = 20000;
 
 export class TranscriptUI {
     constructor(container) {
@@ -17,8 +30,11 @@ export class TranscriptUI {
         this.viewMode = 'single'; // 'single' or 'dual'
         this.showOriginal = true;
 
-        // Segments: each has { original, translation, status, speaker }
+        // Display buffer — trimmed. Each entry: { seq, original, translation, status, speaker, createdAt }
         this.segments = [];
+        // Full record — append-only, shares object refs with `segments`.
+        this.fullSegments = [];
+        this._seq = 0;
         this.provisionalText = '';
         this.provisionalSpeaker = null;
         this.currentSpeaker = null; // Track current speaker to detect changes
@@ -49,33 +65,46 @@ export class TranscriptUI {
      */
     addOriginal(text, speaker) {
         this._removeListening();
-        this.segments.push({
+        const seg = {
+            seq: ++this._seq,
             original: text,
             translation: null,
             status: 'original',
             speaker: speaker || null,
             createdAt: Date.now(),
-        });
+        };
+        this.segments.push(seg);
+        this.fullSegments.push(seg);
         if (speaker) this.currentSpeaker = speaker;
         this._cleanupStaleOriginals();
         this._render();
     }
 
     /**
-     * Apply translation to the oldest untranslated segment
+     * Apply translation to the oldest untranslated segment.
+     *
+     * Matched against `fullSegments`, not `segments` — the original may already have been
+     * trimmed out of the display buffer while its translation was still in flight. Since both
+     * arrays share segment objects, mutating here also updates the overlay when still visible.
      */
     addTranslation(text) {
-        const seg = this.segments.find(s => s.status === 'original');
+        this._sealStaleOriginals();
+        const seg = this.fullSegments.find(s => s.status === 'original');
         if (seg) {
             seg.translation = text;
             seg.status = 'translated';
         } else {
-            this.segments.push({
+            // Translation with no pending original (e.g. resumed session) — keep it as its own segment.
+            const orphan = {
+                seq: ++this._seq,
                 original: '',
                 translation: text,
                 status: 'translated',
                 speaker: null,
-            });
+                createdAt: Date.now(),
+            };
+            this.segments.push(orphan);
+            this.fullSegments.push(orphan);
         }
         this._render();
     }
@@ -124,6 +153,8 @@ export class TranscriptUI {
       </div>
     `;
         this.segments = [];
+        this.fullSegments = [];
+        this._seq = 0;
         this.provisionalText = '';
         this.provisionalSpeaker = null;
         this.currentSpeaker = null;
@@ -179,11 +210,11 @@ export class TranscriptUI {
     }
 
     /**
-     * Get transcript as plain text for copying
+     * Get the full transcript as plain text for copying — whole session, not just what is on screen.
      */
     getPlainText() {
         let lines = [];
-        for (const seg of this.segments) {
+        for (const seg of this.fullSegments) {
             if (seg.original) lines.push(seg.original);
             if (seg.translation) lines.push(seg.translation);
             if (seg.original || seg.translation) lines.push('');
@@ -193,10 +224,51 @@ export class TranscriptUI {
     }
 
     /**
-     * Get formatted content for saving to file (markdown with metadata)
+     * Transcript shaped for the summarizer: speaker-attributed, one turn per line.
+     *
+     * Uses the translation when present and falls back to the original, so a segment whose
+     * translation never arrived still contributes to the meeting summary.
+     */
+    getSummaryText() {
+        const lines = [];
+        let lastSpeaker = null;
+        for (const seg of this.fullSegments) {
+            const text = (seg.translation || seg.original || '').trim();
+            if (!text) continue;
+            if (seg.speaker && seg.speaker !== lastSpeaker) {
+                lines.push('');
+                lines.push(`Speaker ${seg.speaker}:`);
+                lastSpeaker = seg.speaker;
+            }
+            lines.push(text);
+        }
+        return lines.join('\n').trim();
+    }
+
+    /** Counts for the MTG note header. */
+    getStats() {
+        const speakers = new Set();
+        let chars = 0;
+        let translated = 0;
+        for (const seg of this.fullSegments) {
+            if (seg.speaker) speakers.add(seg.speaker);
+            chars += (seg.translation || seg.original || '').length;
+            if (seg.status === 'translated') translated++;
+        }
+        return {
+            segments: this.fullSegments.length,
+            translated,
+            chars,
+            speakers: speakers.size,
+        };
+    }
+
+    /**
+     * Get formatted content for saving to file (markdown with metadata).
+     * Reads the full record so the saved file holds the entire session.
      */
     getFormattedContent(metadata = {}) {
-        if (this.segments.length === 0) return null;
+        if (this.fullSegments.length === 0) return null;
 
         const lines = [];
 
@@ -208,12 +280,14 @@ export class TranscriptUI {
         if (metadata.targetLang) lines.push(`target_language: ${metadata.targetLang}`);
         if (metadata.duration) lines.push(`recording_duration: ${metadata.duration}`);
         if (metadata.audioSource) lines.push(`audio_source: ${metadata.audioSource}`);
-        lines.push(`segments: ${this.segments.length}`);
+        if (metadata.meetingTitle) lines.push(`meeting_title: ${metadata.meetingTitle}`);
+        if (metadata.meetingUrl) lines.push(`meeting_url: ${metadata.meetingUrl}`);
+        lines.push(`segments: ${this.fullSegments.length}`);
         lines.push('---');
         lines.push('');
 
         // Transcript entries
-        for (const seg of this.segments) {
+        for (const seg of this.fullSegments) {
             if (seg.speaker) lines.push(`**Speaker ${seg.speaker}:**`);
             if (seg.original) lines.push(`> ${seg.original}`);
             if (seg.translation) lines.push(seg.translation);
@@ -227,7 +301,7 @@ export class TranscriptUI {
      * Check if there are segments to save
      */
     hasSegments() {
-        return this.segments.length > 0;
+        return this.fullSegments.length > 0;
     }
 
     /**
@@ -236,6 +310,8 @@ export class TranscriptUI {
     clear() {
         this.container.innerHTML = '';
         this.segments = [];
+        this.fullSegments = [];
+        this._seq = 0;
         this.provisionalText = '';
         this.provisionalSpeaker = null;
         this.currentSpeaker = null;
@@ -294,39 +370,53 @@ export class TranscriptUI {
                 if (i < lines.length && !lines[i].trim()) i++;
 
                 const translation = transLines.join('\n').trim();
-                this.segments.push({
+                // 'untranslated', not 'original' — a restored line must never capture a translation
+                // produced later in the resumed session.
+                this._pushRestored({
                     original: original || '',
                     translation: translation || null,
-                    status: translation ? 'translated' : 'original',
+                    status: translation ? 'translated' : 'untranslated',
                     speaker,
-                    createdAt: Date.now(),
                 });
                 speaker = null;
                 continue;
             }
 
             // Translation-only line (no blockquote), or continuation
-            this.segments.push({
+            this._pushRestored({
                 original: '',
                 translation: trimmed,
                 status: 'translated',
                 speaker,
-                createdAt: Date.now(),
             });
             speaker = null;
             i++;
         }
 
-        if (this.segments.length === 0) {
+        if (this.fullSegments.length === 0) {
             this.showPlaceholder();
             return;
         }
 
-        const last = this.segments[this.segments.length - 1];
+        const last = this.fullSegments[this.fullSegments.length - 1];
         if (last && last.speaker) this.currentSpeaker = last.speaker;
 
         this._ensureContent();
         this._render();
+    }
+
+    /** Append a segment restored from markdown to both the display buffer and the full record. */
+    _pushRestored({ original, translation, status, speaker }) {
+        const seg = {
+            seq: ++this._seq,
+            original,
+            translation,
+            status,
+            speaker,
+            createdAt: Date.now(),
+        };
+        this.segments.push(seg);
+        this.fullSegments.push(seg);
     }
 
     // ─── Internal ──────────────────────────────────────────
@@ -382,6 +472,11 @@ export class TranscriptUI {
                     html += `<div class="seg-translated pending">...</div>`;
                     html += `</div>`;
                 }
+            } else if (seg.status === 'untranslated' && seg.original) {
+                // Translation never arrived — show the original alone, no pending placeholder.
+                html += `<div class="seg-block">`;
+                html += `<div class="seg-original">${this._esc(seg.original)}</div>`;
+                html += `</div>`;
             }
         }
 
@@ -429,6 +524,11 @@ export class TranscriptUI {
                 srcHtml += `<div class="seg-text pending">${this._esc(seg.original)}</div>`;
                 tgtHtml += speakerHtml ? '<div class="speaker-label">&nbsp;</div>' : '';
                 tgtHtml += `<div class="seg-text pending">...</div>`;
+            } else if (seg.status === 'untranslated' && seg.original) {
+                srcHtml += speakerHtml;
+                srcHtml += `<div class="seg-text">${this._esc(seg.original)}</div>`;
+                tgtHtml += speakerHtml ? '<div class="speaker-label">&nbsp;</div>' : '';
+                tgtHtml += `<div class="seg-text pending">—</div>`;
             }
         }
 
@@ -475,6 +575,7 @@ export class TranscriptUI {
         }
     }
 
+    /** Trim the *display* buffer only — `fullSegments` keeps every segment. */
     _trimSegments() {
         let totalLen = 0;
         for (const seg of this.segments) {
@@ -487,7 +588,25 @@ export class TranscriptUI {
     }
 
     /**
-     * Remove stale original segments that never received translation.
+     * Close the translation-binding window on originals that have waited too long.
+     *
+     * Without this, an original that never gets a translation stays first in line forever and
+     * swallows the next unrelated translation, shifting every later pairing by one. Marking it
+     * 'untranslated' keeps its text in the record while taking it out of the queue.
+     */
+    _sealStaleOriginals() {
+        const now = Date.now();
+        for (const seg of this.fullSegments) {
+            if (seg.status !== 'original') continue;
+            if (now - seg.createdAt > TRANSLATION_BIND_WINDOW_MS) {
+                seg.status = 'untranslated';
+            }
+        }
+    }
+
+    /**
+     * Remove stale original segments from the *display* buffer so the overlay doesn't fill with
+     * pending lines. The segments survive in `fullSegments`, so nothing is lost from the record.
      * - Originals older than 10s are removed
      * - Max 3 pending originals allowed (oldest dropped)
      */
