@@ -11,10 +11,16 @@ permissions:
 jobs:
   build-macos:
     runs-on: macos-14  # Apple Silicon runner
+    env:
+      # Whether Apple signing is configured. Computed at job level on purpose: the `secrets`
+      # context is NOT available in a step-level `if`, but `env` is. Without this the signing
+      # steps run with an empty certificate and `security import` fails the whole build.
+      HAS_APPLE_CERT: ${{ secrets.APPLE_CERTIFICATE != '' }}
     steps:
       - uses: actions/checkout@v4
 
       - name: Install Apple Certificate
+        if: env.HAS_APPLE_CERT == 'true'
         env:
           CERTIFICATE: ${{ secrets.APPLE_CERTIFICATE }}
           CERTIFICATE_PASSWORD: ${{ secrets.APPLE_CERTIFICATE_PASSWORD }}
@@ -30,6 +36,11 @@ jobs:
           security import $CERT_PATH -P "$CERTIFICATE_PASSWORD" -A -t cert -f pkcs12 -k $KEYCHAIN_PATH
           security set-key-partition-list -S apple-tool:,apple: -k "" $KEYCHAIN_PATH
           security list-keychains -d user -s $KEYCHAIN_PATH login.keychain
+
+      - name: Note unsigned build
+        if: env.HAS_APPLE_CERT != 'true'
+        run: |
+          echo "::warning title=Unsigned build::APPLE_CERTIFICATE is not configured — building unsigned and un-notarized. First launch on macOS needs right-click → Open."
 
       - name: Setup Node.js
         uses: actions/setup-node@v4
@@ -54,11 +65,18 @@ jobs:
         run: yarn install --frozen-lockfile
 
       - name: Build Tauri app (signed + notarized)
+        if: env.HAS_APPLE_CERT == 'true'
         env:
           APPLE_SIGNING_IDENTITY: ${{ secrets.APPLE_SIGNING_IDENTITY }}
           APPLE_ID: ${{ secrets.APPLE_ID }}
           APPLE_PASSWORD: ${{ secrets.APPLE_PASSWORD }}
           APPLE_TEAM_ID: ${{ secrets.APPLE_TEAM_ID }}
+        run: yarn build
+
+      # Separate step rather than empty signing env vars: tauri-bundler branches on those
+      # variables being present, so passing them as empty strings is not the same as omitting them.
+      - name: Build Tauri app (unsigned)
+        if: env.HAS_APPLE_CERT != 'true'
         run: yarn build
 
       - name: Upload macOS artifacts
@@ -71,10 +89,13 @@ jobs:
 
   build-macos-intel:
     runs-on: macos-14  # Cross-compile to Intel
+    env:
+      HAS_APPLE_CERT: ${{ secrets.APPLE_CERTIFICATE != '' }}
     steps:
       - uses: actions/checkout@v4
 
       - name: Install Apple Certificate
+        if: env.HAS_APPLE_CERT == 'true'
         env:
           CERTIFICATE: ${{ secrets.APPLE_CERTIFICATE }}
           CERTIFICATE_PASSWORD: ${{ secrets.APPLE_CERTIFICATE_PASSWORD }}
@@ -90,6 +111,11 @@ jobs:
           security import $CERT_PATH -P "$CERTIFICATE_PASSWORD" -A -t cert -f pkcs12 -k $KEYCHAIN_PATH
           security set-key-partition-list -S apple-tool:,apple: -k "" $KEYCHAIN_PATH
           security list-keychains -d user -s $KEYCHAIN_PATH login.keychain
+
+      - name: Note unsigned build
+        if: env.HAS_APPLE_CERT != 'true'
+        run: |
+          echo "::warning title=Unsigned build::APPLE_CERTIFICATE is not configured — building unsigned and un-notarized."
 
       - name: Setup Node.js
         uses: actions/setup-node@v4
@@ -116,11 +142,16 @@ jobs:
         run: yarn install --frozen-lockfile
 
       - name: Build Tauri app (Intel, signed + notarized)
+        if: env.HAS_APPLE_CERT == 'true'
         env:
           APPLE_SIGNING_IDENTITY: ${{ secrets.APPLE_SIGNING_IDENTITY }}
           APPLE_ID: ${{ secrets.APPLE_ID }}
           APPLE_PASSWORD: ${{ secrets.APPLE_PASSWORD }}
           APPLE_TEAM_ID: ${{ secrets.APPLE_TEAM_ID }}
+        run: yarn build -- --target x86_64-apple-darwin
+
+      - name: Build Tauri app (Intel, unsigned)
+        if: env.HAS_APPLE_CERT != 'true'
         run: yarn build -- --target x86_64-apple-darwin
 
       - name: Upload macOS Intel artifacts
