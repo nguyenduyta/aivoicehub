@@ -216,8 +216,14 @@ export class MeetingNoteDialog {
      * written with the transcript, because losing the meeting record is the worse outcome.
      */
     async autoExport(ctx) {
+        // Auto-export can fire more than once for the same session (e.g. Stop
+        // called twice in a row) — only forget the previous save path when
+        // this is actually a different session, so re-exports overwrite
+        // instead of piling up duplicate files.
+        const sameSession =
+            this.ctx?.sessionId && ctx.sessionId && this.ctx.sessionId === ctx.sessionId;
         this.ctx = ctx;
-        this.savedPath = null;
+        if (!sameSession) this.savedPath = null;
 
         const transcript = (ctx.transcript || '').trim();
         if (!transcript) return null;

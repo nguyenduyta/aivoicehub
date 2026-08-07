@@ -256,17 +256,22 @@ export class SonioxClient {
                 continue;
             }
 
-            if (token.speaker && token.translation_status === 'original') {
+            // Without a translation request, Soniox omits `translation_status`
+            // entirely — every token is the (only) transcription, so treat
+            // missing status the same as 'original'.
+            const status = token.translation_status || 'original';
+
+            if (token.speaker && status === 'original') {
                 speaker = token.speaker;
             }
 
-            if (token.translation_status === 'original') {
+            if (status === 'original') {
                 if (token.is_final) {
                     originalText += token.text;
                 } else {
                     provisionalText += token.text;
                 }
-            } else if (token.translation_status === 'translation') {
+            } else if (status === 'translation') {
                 if (token.is_final) {
                     translationText += token.text;
                 }
