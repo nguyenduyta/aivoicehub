@@ -42,6 +42,10 @@ pub struct Settings {
     pub source_language: String,
     /// Target language: ISO 639-1 code
     pub target_language: String,
+    /// Whether to translate at all. When false the app transcribes only — Soniox is asked
+    /// for no translation and the local pipeline skips the LLM step, so subtitles are the
+    /// recognised text itself. `target_language` is kept so toggling back restores the choice.
+    pub translation_enabled: bool,
     /// Audio source: "system" | "microphone" | "both"
     pub audio_source: String,
     /// Overlay opacity: 0.0 - 1.0
@@ -124,7 +128,8 @@ impl Default for Settings {
             openai_api_key: String::new(),
             source_language: "auto".to_string(),
             target_language: "vi".to_string(),
-            audio_source: "system".to_string(),
+            translation_enabled: true,
+            audio_source: "both".to_string(),
             overlay_opacity: 0.85,
             font_size: 16,
             max_lines: 5,

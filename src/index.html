@@ -32,13 +32,13 @@
 
         <div class="control-bar-work">
           <div class="source-controls">
-            <button id="btn-source-system" class="source-btn active" title="System Audio (⌘1)">
+            <button id="btn-source-system" class="source-btn active" title="System Audio — click to add/remove from the mix (⌘1)">
               <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
                 <polygon points="11 5 6 9 2 9 2 15 6 15 11 19 11 5" />
                 <path d="M19.07 4.93a10 10 0 0 1 0 14.14M15.54 8.46a5 5 0 0 1 0 7.07" />
               </svg>
             </button>
-            <button id="btn-source-mic" class="source-btn" title="Microphone (⌘2)">
+            <button id="btn-source-mic" class="source-btn" title="Microphone — click to add/remove from the mix (⌘2)">
               <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
                 <path d="M12 1a3 3 0 0 0-3 3v8a3 3 0 0 0 6 0V4a3 3 0 0 0-3-3z" />
                 <path d="M19 10v2a7 7 0 0 1-14 0v-2" />
@@ -245,6 +245,14 @@
         </div>
 
         <div class="settings-section">
+          <label class="checkbox-option">
+            <input type="checkbox" id="check-translation-enabled" checked />
+            <span class="checkbox-label">Translate</span>
+          </label>
+          <p class="hint">Off = transcribe only. Subtitles show the recognised speech as-is — no target language, no translation cost or delay.</p>
+        </div>
+
+        <div class="settings-section">
           <div class="field-row">
             <div class="field">
               <span class="field-label">Source</span>
@@ -262,7 +270,7 @@
                 <option value="id">Indonesian</option>
               </select>
             </div>
-            <div class="field">
+            <div class="field" id="field-target-lang">
               <span class="field-label">Target</span>
               <select id="select-target-lang">
                 <option value="vi">Vietnamese</option>
@@ -283,9 +291,9 @@
         <div class="settings-section">
           <span class="field-label">Audio Source</span>
           <div class="radio-group" id="audio-source-group">
-            <label class="radio-option"><input type="radio" name="audio-source" value="system" checked /><span class="radio-label">System</span></label>
+            <label class="radio-option"><input type="radio" name="audio-source" value="system" /><span class="radio-label">System</span></label>
             <label class="radio-option"><input type="radio" name="audio-source" value="microphone" /><span class="radio-label">Mic</span></label>
-            <label class="radio-option"><input type="radio" name="audio-source" value="both" /><span class="radio-label">Both</span></label>
+            <label class="radio-option"><input type="radio" name="audio-source" value="both" checked /><span class="radio-label">Both</span></label>
           </div>
         </div>
 

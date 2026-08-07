@@ -1,4 +1,5 @@
 pub mod microphone;
+pub mod mixer;
 
 #[cfg(target_os = "macos")]
 pub mod system_audio;
