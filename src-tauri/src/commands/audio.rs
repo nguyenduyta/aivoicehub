@@ -30,15 +30,28 @@ pub struct PermissionStatus {
     pub microphone: String,
 }
 
+/// What `start_capture` actually ended up capturing.
+///
+/// `active_source` can differ from the requested source when a device is unavailable, so the
+/// UI reflects reality instead of what was asked for.
+#[derive(Serialize, Clone)]
+pub struct CaptureStatus {
+    pub active_source: String,
+    pub warning: Option<String>,
+}
+
 /// Start audio capture and forward data to the frontend via IPC channel
 #[tauri::command]
 pub fn start_capture(
     source: String,
     channel: Channel<Vec<u8>>,
     state: State<'_, AudioState>,
-) -> Result<(), String> {
+) -> Result<CaptureStatus, String> {
     // Stop any existing capture first
     stop_capture_inner(&state);
+
+    let mut active_source = source.clone();
+    let mut warning: Option<String> = None;
 
     let receiver: mpsc::Receiver<Vec<u8>> = match source.as_str() {
         "system" => {
@@ -48,6 +61,26 @@ pub fn start_capture(
         "microphone" => {
             let mut mic = state.microphone.lock().map_err(|e| e.to_string())?;
             mic.start()?
+        }
+        // System audio carries the remote participants, the microphone carries the local
+        // speaker — a meeting transcript needs both. Locks are taken system-then-mic to match
+        // `stop_capture_inner`, so the two can never deadlock against each other.
+        "both" => {
+            let sys = state.system_audio.lock().map_err(|e| e.to_string())?;
+            let mut mic = state.microphone.lock().map_err(|e| e.to_string())?;
+
+            let sys_rx = sys.start()?;
+            match mic.start() {
+                Ok(mic_rx) => crate::audio::mixer::mix(sys_rx, mic_rx),
+                // "both" is the default, so a machine with no usable microphone must still
+                // record the meeting. Degrade to system audio and let the UI say so rather
+                // than failing a capture that was already half working.
+                Err(e) => {
+                    active_source = "system".to_string();
+                    warning = Some(format!("Microphone unavailable ({e}) — recording system audio only."));
+                    sys_rx
+                }
+            }
         }
         _ => return Err(format!("Unknown source: {}", source)),
     };
@@ -99,7 +132,7 @@ pub fn start_capture(
     let mut active = state.active_receiver.lock().map_err(|e| e.to_string())?;
     *active = Some(forwarder);
 
-    Ok(())
+    Ok(CaptureStatus { active_source, warning })
 }
 
 /// Stop audio capture

@@ -37,47 +37,24 @@ impl MicCapture {
 
         let host = cpal::default_host();
 
-        // List available input devices for debugging
-        let input_devices: Vec<String> = host.input_devices()
-            .map(|devs| devs.filter_map(|d| d.name().ok()).collect())
-            .unwrap_or_default();
-        println!("[Mic] Available input devices: {:?}", input_devices);
-
-        if input_devices.is_empty() {
-            return Err("No microphone found. Connect an external microphone or headset.".to_string());
-        }
-
+        // Deliberately NOT calling `host.input_devices()` for a device listing: cpal's
+        // coreaudio backend implements that filter by calling `supported_input_configs()`
+        // on *every* device, and each of those creates and initializes an AUHAL AudioUnit
+        // (cpal 0.15.3 host/coreaudio/macos/mod.rs:300 -> coreaudio-rs AudioUnit::new ->
+        // AudioUnitInitialize). A 0.5.0 crash report showed SIGILL inside CoreAudio's
+        // caulk allocator on exactly that path, so we now touch CoreAudio the minimum
+        // number of times: default device + its default config.
         let device = host
             .default_input_device()
-            .ok_or("No default microphone found. Connect an external microphone or headset.")?;
+            .ok_or("No microphone found. Connect an external microphone or headset.")?;
 
         println!("[Mic] Device: {:?}", device.name().unwrap_or_default());
 
-        // Try default config first, fallback to supported configs
-        let default_config = device.default_input_config()
-            .or_else(|e| {
-                println!("[Mic] default_input_config failed: {}, trying supported configs", e);
-                // Fallback: find a supported config
-                let mut configs = device.supported_input_configs()
-                    .map_err(|e2| format!("No supported input configs: {}", e2))?;
-                // Prefer F32, then I16
-                configs
-                    .find(|c| c.sample_format() == cpal::SampleFormat::F32)
-                    .or_else(|| {
-                        device.supported_input_configs().ok()
-                            .and_then(|mut c| c.next())
-                    })
-                    .map(|c| {
-                        // Pick sample rate: prefer 48kHz, else max
-                        let rate = if c.min_sample_rate().0 <= 48000 && c.max_sample_rate().0 >= 48000 {
-                            cpal::SampleRate(48000)
-                        } else {
-                            c.max_sample_rate()
-                        };
-                        c.with_sample_rate(rate)
-                    })
-                    .ok_or_else(|| format!("No suitable input config found (original: {})", e))
-            })
+        // No `supported_input_configs()` fallback on purpose — it goes through the same
+        // AudioUnitInitialize path, and a SIGILL raised inside CoreAudio cannot be caught
+        // from Rust. Failing with a message beats probing further and taking the process down.
+        let default_config = device
+            .default_input_config()
             .map_err(|e| format!("Failed to get default input config: {}", e))?;
 
         println!(

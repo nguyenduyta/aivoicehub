@@ -29,6 +29,9 @@ export class TranscriptUI {
         this.fontSize = 16;
         this.viewMode = 'single'; // 'single' or 'dual'
         this.showOriginal = true;
+        // When false, segments never receive a translation, so the original IS the subtitle:
+        // render it on its own with no "..." placeholder and no second column.
+        this.translationEnabled = true;
 
         // Display buffer — trimmed. Each entry: { seq, original, translation, status, speaker, createdAt }
         this.segments = [];
@@ -43,9 +46,10 @@ export class TranscriptUI {
     /**
      * Update display settings
      */
-    configure({ maxLines, showOriginal, fontSize, viewMode }) {
+    configure({ maxLines, showOriginal, translationEnabled, fontSize, viewMode }) {
         if (maxLines !== undefined) this.maxChars = maxLines * 160;
         if (showOriginal !== undefined) this.showOriginal = !!showOriginal;
+        if (translationEnabled !== undefined) this.translationEnabled = !!translationEnabled;
         if (fontSize !== undefined) {
             this.fontSize = fontSize;
             this.container.style.setProperty('--transcript-font-size', `${fontSize}px`);
@@ -439,7 +443,8 @@ export class TranscriptUI {
         this._ensureContent();
         this._trimSegments();
 
-        if (this.viewMode === 'dual') {
+        // Dual view is a source/translation split — pointless with translation off.
+        if (this.viewMode === 'dual' && this.translationEnabled) {
             this._renderDual();
         } else {
             this._renderSingle();
@@ -454,6 +459,15 @@ export class TranscriptUI {
             if (seg.speaker && seg.speaker !== lastRenderedSpeaker) {
                 html += `<span class="speaker-label">Speaker ${seg.speaker}:</span> `;
                 lastRenderedSpeaker = seg.speaker;
+            }
+
+            // Transcribe-only: the original is the subtitle. No pending placeholder — nothing
+            // is coming — and no `parallel` layout, which would leave an empty second column.
+            if (!this.translationEnabled) {
+                if (seg.original) {
+                    html += `<div class="seg-block"><div class="seg-original">${this._esc(seg.original)}</div></div>`;
+                }
+                continue;
             }
 
             if (seg.status === 'translated' && seg.translation) {
@@ -484,7 +498,9 @@ export class TranscriptUI {
             if (this.provisionalSpeaker && this.provisionalSpeaker !== lastRenderedSpeaker) {
                 html += `<span class="speaker-label">Speaker ${this.provisionalSpeaker}:</span> `;
             }
-            if (this.showOriginal) {
+            if (!this.translationEnabled) {
+                html += `<div class="seg-block"><div class="seg-provisional">${this._esc(this.provisionalText)}</div></div>`;
+            } else if (this.showOriginal) {
                 html += `<div class="seg-block parallel">`;
                 html += `<div class="seg-provisional">${this._esc(this.provisionalText)}</div>`;
                 html += `<div class="seg-translated pending">...</div>`;
@@ -611,6 +627,11 @@ export class TranscriptUI {
      * - Max 3 pending originals allowed (oldest dropped)
      */
     _cleanupStaleOriginals() {
+        // With translation off, `original` is the final state of every segment rather than a
+        // pending one — dropping them here would wipe the overlay after 10s and cap it at 3
+        // lines. `_trimSegments()` already bounds the display buffer in that mode.
+        if (!this.translationEnabled) return;
+
         const now = Date.now();
         const STALE_MS = 10000; // 10 seconds
         const MAX_PENDING = 3;

@@ -56,7 +56,12 @@ class LocalPipeline:
         self.asr_model_type = asr_model  # "whisper" or "qwen"
         self.source_lang = source_lang
         self.target_lang = target_lang
-        self.target_lang_name = LANG_NAMES.get(target_lang, "Vietnamese")
+        # "none" = transcribe-only mode: the translator LLM is never loaded and every
+        # result carries an empty "translated" field.
+        self.translate_enabled = target_lang != "none"
+        # Only meaningful when translate_enabled; None makes a stray read fail loudly
+        # instead of silently prompting for Vietnamese.
+        self.target_lang_name = LANG_NAMES.get(target_lang, "Vietnamese") if self.translate_enabled else None
         self.chunk_seconds = chunk_seconds
         self.stride_seconds = stride_seconds
         self.sample_rate = 16000
@@ -115,17 +120,20 @@ class LocalPipeline:
             raise ValueError(f"Unknown ASR model: {self.asr_model_type}")
 
         # --- LLM Translator ---
-        log("Loading Gemma-3-4B translator...")
-        emit({"type": "status", "message": "Loading Gemma-3-4B translator..."})
-        t = time.time()
-        from mlx_lm import load
-        self.llm_model, self.llm_tokenizer = load("mlx-community/gemma-3-4b-it-qat-4bit")
-        log(f"LLM loaded in {time.time()-t:.1f}s")
+        if self.translate_enabled:
+            log("Loading Gemma-3-4B translator...")
+            emit({"type": "status", "message": "Loading Gemma-3-4B translator..."})
+            t = time.time()
+            from mlx_lm import load
+            self.llm_model, self.llm_tokenizer = load("mlx-community/gemma-3-4b-it-qat-4bit")
+            log(f"LLM loaded in {time.time()-t:.1f}s")
 
-        # Warm up LLM
-        log("Warming up LLM...")
-        emit({"type": "status", "message": "Warming up translator..."})
-        self._translate("テスト")
+            # Warm up LLM
+            log("Warming up LLM...")
+            emit({"type": "status", "message": "Warming up translator..."})
+            self._translate("テスト")
+        else:
+            log("Translation disabled — skipping translator LLM load")
 
         log("Pipeline ready!")
         emit({"type": "ready"})
@@ -328,7 +336,7 @@ class LocalPipeline:
 
             # Translate
             t2 = time.time()
-            translated = self._translate(new_text)
+            translated = self._translate(new_text) if self.translate_enabled else ""
             t_llm = time.time() - t2
 
             total = time.time() - t_start

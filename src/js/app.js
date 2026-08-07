@@ -16,6 +16,13 @@ import { MeetingNoteDialog } from './meeting-note.js';
 const { invoke } = window.__TAURI__.core;
 const { getCurrentWindow } = window.__TAURI__.window;
 
+/** Human labels for `audio_source`. Keys must match the values `start_capture` accepts. */
+const SOURCE_LABELS = {
+    system: 'System Audio',
+    microphone: 'Microphone',
+    both: 'System Audio + Microphone',
+};
+
 /**
  * Domain hints for Soniox — must match `value` in `#select-context-preset` (Settings → Context).
  * Open-source: contributors can add presets here and in index.html.
@@ -39,7 +46,7 @@ class App {
     constructor() {
         this.isRunning = false;
         this.isStarting = false; // Guard against re-entry
-        this.currentSource = 'system'; // 'system' | 'microphone'
+        this.currentSource = 'both'; // 'system' | 'microphone' | 'both'
         this.translationMode = 'soniox'; // 'soniox' | 'local'
         this.transcriptUI = null;
         this.appWindow = getCurrentWindow();
@@ -363,13 +370,13 @@ class App {
             }
         });
 
-        // Source buttons
+        // Source buttons — each toggles its own device in/out of the mix
         document.getElementById('btn-source-system').addEventListener('click', () => {
-            this._setSource('system');
+            this._toggleSource('system');
         });
 
         document.getElementById('btn-source-mic').addEventListener('click', () => {
-            this._setSource('microphone');
+            this._toggleSource('microphone');
         });
 
         // Clear button — save transcript file then clear
@@ -481,6 +488,11 @@ class App {
         // Translation mode toggle
         document.getElementById('select-translation-mode').addEventListener('change', (e) => {
             this._updateModeUI(e.target.value);
+        });
+
+        // Translate on/off — greys out the target language picker, which is meaningless when off
+        document.getElementById('check-translation-enabled')?.addEventListener('change', (e) => {
+            this._updateTranslationToggleUI(e.target.checked);
         });
 
         // Soniox link
@@ -674,16 +686,16 @@ class App {
                 this._showView('settings');
             }
 
-            // Cmd/Ctrl + 1: Switch to System Audio
+            // Cmd/Ctrl + 1: Toggle System Audio in/out of the mix
             if ((e.metaKey || e.ctrlKey) && e.key === '1') {
                 e.preventDefault();
-                this._setSource('system');
+                this._toggleSource('system');
             }
 
-            // Cmd/Ctrl + 2: Switch to Microphone
+            // Cmd/Ctrl + 2: Toggle Microphone in/out of the mix
             if ((e.metaKey || e.ctrlKey) && e.key === '2') {
                 e.preventDefault();
-                this._setSource('microphone');
+                this._toggleSource('microphone');
             }
 
             // Cmd/Ctrl + T: Toggle TTS
@@ -782,6 +794,8 @@ class App {
         document.getElementById('input-openai-key').value = s.openai_api_key || '';
         document.getElementById('select-source-lang').value = s.source_language || 'auto';
         document.getElementById('select-target-lang').value = s.target_language || 'vi';
+        document.getElementById('check-translation-enabled').checked = s.translation_enabled !== false;
+        this._updateTranslationToggleUI(s.translation_enabled !== false);
         document.getElementById('select-translation-mode').value = s.translation_mode || 'soniox';
         this._updateModeUI(s.translation_mode || 'soniox');
 
@@ -1047,6 +1061,7 @@ class App {
             openai_api_key: document.getElementById('input-openai-key')?.value.trim() || '',
             source_language: document.getElementById('select-source-lang').value,
             target_language: document.getElementById('select-target-lang').value,
+            translation_enabled: document.getElementById('check-translation-enabled').checked,
             translation_mode: document.getElementById('select-translation-mode').value,
             audio_source: document.querySelector('input[name="audio-source"]:checked')?.value || 'system',
             overlay_opacity: parseInt(document.getElementById('range-opacity').value) / 100,
@@ -1151,13 +1166,19 @@ class App {
             this.transcriptUI.configure({
                 maxLines: settings.max_lines || 5,
                 showOriginal: settings.show_original !== false,
+                translationEnabled: settings.translation_enabled !== false,
                 fontSize: settings.font_size || 16,
             });
         }
 
-        // Update current source button states
-        this.currentSource = settings.audio_source === 'both' ? 'system' : (settings.audio_source || 'system');
-        this._updateSourceButtons();
+        // Update current source button states. Not while running: a capture may have degraded
+        // to a single source (missing mic), and saving any unrelated setting would otherwise
+        // reset the buttons to the configured value and re-light a mic that isn't recording.
+        // Changing the source mid-session goes through `_setSource`, which restarts capture.
+        if (!this.isRunning) {
+            this.currentSource = settings.audio_source || 'both';
+            this._updateSourceButtons();
+        }
 
         // TTS is always OFF on app start — user must toggle on each session
         this.ttsEnabled = false;
@@ -1169,6 +1190,13 @@ class App {
     _toggleTTS() {
         const settings = settingsManager.get();
         const provider = settings.tts_provider || 'edge';
+
+        // TTS narrates translations. With translation off there is nothing to narrate,
+        // so say that outright instead of leaving the user with a silent "ON" button.
+        if (settings.translation_enabled === false) {
+            this._showToast('TTS narrates translations — turn Translate on in Settings first.', 'info');
+            return;
+        }
 
         // Check API key for premium providers
         if (provider === 'elevenlabs' && !settings.elevenlabs_api_key) {
@@ -1284,6 +1312,10 @@ class App {
     // ─── Source Control ────────────────────────────────────
 
     _setSource(source) {
+        // A switch is a full stop/start cycle. Two quick ⌘1/⌘2 presses would otherwise queue
+        // two of them and let the second stop() land inside the first start().
+        if (this._switchingSource) return;
+
         const wasRunning = this.isRunning;
 
         // If currently running, restart with new source
@@ -1294,7 +1326,7 @@ class App {
             this.stop().then(() => {
                 this.currentSource = source;
                 this._updateSourceButtons();
-                this._showToast(`Switched to ${source === 'system' ? 'System Audio' : 'Microphone'}`, 'success');
+                this._showToast(`Switched to ${SOURCE_LABELS[source] || source}`, 'success');
                 return this.start();
             }).finally(() => {
                 this._switchingSource = false;
@@ -1302,15 +1334,54 @@ class App {
         } else {
             this.currentSource = source;
             this._updateSourceButtons();
-            this._showToast(`Source: ${source === 'system' ? 'System Audio' : 'Microphone'}`, 'success');
+            this._showToast(`Source: ${SOURCE_LABELS[source] || source}`, 'success');
+        }
+    }
+
+    /**
+     * The overlay has one button per capture device rather than a "Both" button: "both" is
+     * simply the state where each is lit, and clicking one toggles it out of the mix. Dropping
+     * the last active source would leave nothing to transcribe, so that click is ignored.
+     */
+    _toggleSource(source) {
+        const active = new Set(
+            this.currentSource === 'both' ? ['system', 'microphone'] : [this.currentSource]
+        );
+        if (active.has(source)) {
+            if (active.size === 1) {
+                this._showToast('At least one audio source has to stay on.', 'info');
+                return;
+            }
+            active.delete(source);
+        } else {
+            active.add(source);
+        }
+        this._setSource(active.size === 2 ? 'both' : [...active][0]);
+    }
+
+    /**
+     * `start_capture` reports what it actually opened. With source "both" a missing microphone
+     * degrades to system audio instead of failing, so reflect that in the buttons and say why —
+     * otherwise the mic button stays lit over a stream that carries no mic audio.
+     */
+    _applyCaptureStatus(status) {
+        if (!status) return; // older backend, or the dummy permission-check call
+        if (status.active_source && status.active_source !== this.currentSource) {
+            this.currentSource = status.active_source;
+            this._updateSourceButtons();
+        }
+        if (status.warning) {
+            console.warn('[App]', status.warning);
+            this._showToast(status.warning, 'error');
         }
     }
 
     _updateSourceButtons() {
+        const both = this.currentSource === 'both';
         document.getElementById('btn-source-system').classList.toggle('active',
-            this.currentSource === 'system');
+            both || this.currentSource === 'system');
         document.getElementById('btn-source-mic').classList.toggle('active',
-            this.currentSource === 'microphone');
+            both || this.currentSource === 'microphone');
     }
 
     _updateModeUI(mode) {
@@ -1319,6 +1390,22 @@ class App {
 
         if (hintSoniox) hintSoniox.style.display = mode === 'soniox' ? '' : 'none';
         if (hintLocal) hintLocal.style.display = mode === 'local' ? '' : 'none';
+    }
+
+    _updateTranslationToggleUI(enabled) {
+        const targetField = document.getElementById('field-target-lang');
+        const targetSelect = document.getElementById('select-target-lang');
+        if (targetSelect) targetSelect.disabled = !enabled;
+        if (targetField) targetField.style.opacity = enabled ? '' : '0.45';
+
+        // "Show original text" only chooses whether the source line accompanies a translation.
+        // With no translation the original is the subtitle, so the option has nothing to do.
+        const showOriginal = document.getElementById('check-show-original');
+        if (showOriginal) {
+            showOriginal.disabled = !enabled;
+            const label = showOriginal.closest('.checkbox-option');
+            if (label) label.style.opacity = enabled ? '' : '0.45';
+        }
     }
 
     // ─── Start/Stop ────────────────────────────────────────
@@ -1375,7 +1462,9 @@ class App {
         sonioxClient.connect({
             apiKey: settings.soniox_api_key,
             sourceLanguage: settings.source_language,
-            targetLanguage: settings.target_language,
+            // null → the client omits the `translation` block, so Soniox returns
+            // transcription tokens only (no translation billing, no extra latency).
+            targetLanguage: settings.translation_enabled === false ? null : settings.target_language,
             customContext: settings.custom_context,
         });
 
@@ -1395,10 +1484,11 @@ class App {
             };
 
             console.log('[App] Starting audio capture, source:', this.currentSource);
-            await invoke('start_capture', {
+            const status = await invoke('start_capture', {
                 source: this.currentSource,
                 channel: channel,
             });
+            this._applyCaptureStatus(status);
             console.log('[App] Audio capture started successfully');
         } catch (err) {
             console.error('Failed to start audio capture:', err);
@@ -1413,10 +1503,14 @@ class App {
 
         // Step 0: Check audio permission FIRST (before loading models)
         try {
-            await invoke('start_capture', {
+            const status = await invoke('start_capture', {
                 source: this.currentSource,
                 channel: new window.__TAURI__.core.Channel(), // dummy channel for permission check
             });
+            // Resolve a missing microphone here, before the multi-minute model load — and so the
+            // real capture below asks for the source that actually works instead of retrying the
+            // failing device a second time.
+            this._applyCaptureStatus(status);
             await invoke('stop_capture');
         } catch (err) {
             console.error('[App] Audio permission check failed:', err);
@@ -1474,7 +1568,10 @@ class App {
 
             await invoke('start_local_pipeline', {
                 sourceLang: sourceLang,
-                targetLang: settings.target_language || 'vi',
+                // "none" tells local_pipeline.py to skip loading and running the translator LLM.
+                targetLang: settings.translation_enabled === false
+                    ? 'none'
+                    : (settings.target_language || 'vi'),
                 channel: this.localPipelineChannel,
             });
             console.log('[App] Local pipeline spawned');
@@ -1502,10 +1599,11 @@ class App {
                 }
             };
 
-            await invoke('start_capture', {
+            const status = await invoke('start_capture', {
                 source: this.currentSource,
                 channel: audioChannel,
             });
+            this._applyCaptureStatus(status);
             console.log('[App] Audio capture started');
         } catch (err) {
             console.error('Audio capture failed (pipeline still running):', err);
