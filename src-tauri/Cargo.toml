@@ -45,3 +45,9 @@ windows = { version = "0.58", features = [
   "Win32_System_Com",
   "Win32_Foundation",
 ] }
+
+# Recent macOS dyld rejects stripped proc-macro dylibs ("mis-aligned LINKEDIT string pool"),
+# which breaks release builds. Keep build scripts and proc-macros unstripped; the app binary
+# is still stripped as usual.
+[profile.release.build-override]
+strip = false
