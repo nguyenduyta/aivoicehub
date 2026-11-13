@@ -318,13 +318,19 @@ class App {
         });
 
         // Close button (overlay)
+        // The window disappears at once; saving the transcript and writing the meeting note
+        // (which can take minutes for a long meeting) carry on hidden, then the app exits.
         document.getElementById('btn-close').addEventListener('click', async () => {
-            if (this.transcriptUI.hasSegments()) {
-                await this._saveTranscriptFile();
-            }
             await this._saveWindowPosition();
-            await this.stop();
-            await this.appWindow.close();
+            await this.appWindow.hide();
+            try {
+                if (this.transcriptUI.hasSegments()) {
+                    await this._saveTranscriptFile();
+                }
+                await this.stop();
+            } finally {
+                await this.appWindow.close();
+            }
         });
 
         // Minimize button
