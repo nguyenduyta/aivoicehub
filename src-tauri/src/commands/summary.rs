@@ -35,14 +35,23 @@ fn chunk_text(s: &str, max_chars: usize) -> Vec<String> {
         return vec![s.to_string()];
     }
 
+    // Offsets are bytes, so every slice point is snapped back to a char boundary. Without this a
+    // long Japanese/Vietnamese transcript panics on `s[a..b]` and the command never returns.
+    let floor = |mut i: usize| {
+        while !s.is_char_boundary(i) {
+            i -= 1;
+        }
+        i
+    };
+
     let mut chunks = Vec::new();
     let mut start = 0usize;
     while start < s.len() {
-        let end = (start + max_chars).min(s.len());
+        let end = floor((start + max_chars).min(s.len()));
         let mut cut = end;
 
         // Try to cut on a paragraph boundary near the end
-        let window_start = start.saturating_add((max_chars as f32 * 0.7) as usize);
+        let window_start = floor(start.saturating_add((max_chars as f32 * 0.7) as usize));
         if window_start < end {
             if let Some(pos) = s[window_start..end].rfind("\n\n") {
                 cut = window_start + pos + 2;
@@ -51,9 +60,12 @@ fn chunk_text(s: &str, max_chars: usize) -> Vec<String> {
             }
         }
 
-        // Safety: ensure progress
+        // Safety: ensure progress (a single char wider than max_chars still moves forward)
         if cut <= start {
             cut = end;
+        }
+        if cut <= start {
+            cut = start + s[start..].chars().next().map_or(1, char::len_utf8);
         }
 
         chunks.push(s[start..cut].to_string());
@@ -64,7 +76,11 @@ fn chunk_text(s: &str, max_chars: usize) -> Vec<String> {
 }
 
 async fn call_openai(api_key: &str, model: &str, system: &str, user: &str) -> Result<String, String> {
-    let client = reqwest::Client::new();
+    // A stalled request would otherwise hang Stop/Close, which wait for the meeting note.
+    let client = reqwest::Client::builder()
+        .timeout(std::time::Duration::from_secs(180))
+        .build()
+        .map_err(|e| format!("HTTP client error: {}", e))?;
     let req = ChatCompletionRequest {
         model: model.to_string(),
         messages: vec![
@@ -477,6 +493,18 @@ mod tests {
         assert!(chunks.len() > 1);
         // No content lost.
         assert_eq!(chunks.concat().len(), text.len());
+    }
+
+    #[test]
+    fn chunking_multibyte_text_does_not_panic() {
+        // 3-byte chars with no newlines: byte offsets land mid-char unless snapped.
+        let text = "会議の内容を記録します。".repeat(2000);
+        let chunks = chunk_text(&text, 12_000);
+        assert!(chunks.len() > 1);
+        assert_eq!(chunks.concat(), text);
+
+        let vi = "Cuộc họp dài quá không lưu được\n".repeat(1500);
+        assert_eq!(chunk_text(&vi, 12_000).concat(), vi);
     }
 }
 
